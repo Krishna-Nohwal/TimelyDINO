@@ -334,7 +334,8 @@ class VideoViT(nn.Module):
     temporal_vec      : concat of NUM_TEMPORAL_HEADS temporal outputs
                         (4 × 1024 = 4096)
     memory_bank       : optional frozen real-video prototypes gated into CLS tokens
-                        before the temporal transformers
+                        before the temporal transformers with a learned
+                        per-head, per-feature gate
 
     Fusion input dim = 4096, with or without memory.
 
@@ -358,7 +359,7 @@ class VideoViT(nn.Module):
         self.use_memory_bank = use_memory_bank
         self.memory_bank: Optional[RealVideoMemoryBank] = None
         self.memory_gate = nn.Parameter(
-            torch.full((self.NUM_TEMPORAL_HEADS, 1, 1), -2.0)
+            torch.full((self.NUM_TEMPORAL_HEADS, 1, self.EMBED_DIM), -2.0)
         ) if use_memory_bank else None
 
         self.frame_model = ViT()
