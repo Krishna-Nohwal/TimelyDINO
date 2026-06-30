@@ -23,8 +23,9 @@ from frame_model import ViT  # 4-tap backbone: layers [20,21,22,23]
 # frame_model_4layers.ViT.forward returns a 3-tuple:
 #   (logits_list, features_list, cls_list)
 # — NOT a 4-tuple with fused_list, so VideoViT.forward below unpacks 3
-# values from self.frame_model(frames), and frame_mean_logits is taken
-# from the deepest tap, index 3 (NUM_TEMPORAL_HEADS - 1), not index 4.
+# values from self.frame_model(frames). VideoViT's learned video classifier
+# uses temporal transformer outputs only; frame logits are still returned for
+# frame/video-mean metrics.
 
 
 # ---------------------------------------------------------------------------
@@ -33,15 +34,14 @@ from frame_model import ViT  # 4-tap backbone: layers [20,21,22,23]
 
 class RealVideoMemoryBank:
     """
-    Per-head kNN memory bank of real video embeddings.
+    Per-head kNN memory bank of frozen real-video CLS prototypes.
 
-    Stores L2-normalised embeddings from real training videos, one bank per
-    temporal transformer head.  At query time returns the mean cosine
-    similarity between the query embedding and its k nearest real neighbours
-    — one scalar per head.
+    Stores one mean-pooled CLS prototype per real training video and tapped
+    frame-model head. At query time retrieves a weighted real-video prototype
+    that is mixed into the current CLS sequence by a learned gate.
 
-    Because the backbone is frozen, embeddings are stable across training so
-    the bank is built once before epoch 1 and never updated.
+    Because these prototypes come from the frozen frame backbone, they are
+    stable across Stage 2 training and the bank can be built once.
 
     Uses exact inner-product search over L2-normalised vectors (≡ cosine
     similarity).  FAISS is used when available; falls back to pure-PyTorch
@@ -59,11 +59,16 @@ class RealVideoMemoryBank:
         embed_dim: int = 1024,
         num_heads: int = 4,   # updated default: 4 tapped layers
         k:         int = 32,
+        temperature: float = 0.1,
     ):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.k         = k
-        self._banks: List[np.ndarray] = [
+        self.temperature = temperature
+        self._keys: List[np.ndarray] = [
+            np.zeros((0, embed_dim), dtype=np.float32) for _ in range(num_heads)
+        ]
+        self._values: List[np.ndarray] = [
             np.zeros((0, embed_dim), dtype=np.float32) for _ in range(num_heads)
         ]
         self._use_faiss     = False
@@ -78,35 +83,53 @@ class RealVideoMemoryBank:
 
     # ── Building ────────────────────────────────────────────────────────────
 
-    def add(self, video_feats_list: List[Tensor]):
-        """
-        Add a batch of real video embeddings to the bank.
+    def _mean_pool_valid(self, feats: Tensor, key_padding_mask: Optional[Tensor]) -> Tensor:
+        if feats.dim() == 2:
+            return feats.float()
 
-        video_feats_list : list of num_heads × (B, embed_dim) tensors
+        if key_padding_mask is None:
+            return feats.float().mean(dim=1)
+
+        valid = (~key_padding_mask).to(feats.device).float().unsqueeze(-1)
+        counts = valid.sum(dim=1).clamp(min=1)
+        return (feats.float() * valid).sum(dim=1) / counts
+
+    def add(self, video_feats_list: List[Tensor], key_padding_mask: Optional[Tensor] = None):
+        """
+        Add a batch of frozen real-video CLS prototypes to the bank.
+
+        video_feats_list : list of num_heads tensors, each (B, T, embed_dim) or (B, embed_dim)
         """
         for h, feats in enumerate(video_feats_list):
-            normed = F.normalize(feats.float(), dim=-1).detach().cpu().numpy()
-            self._banks[h] = np.concatenate([self._banks[h], normed], axis=0)
+            values = self._mean_pool_valid(feats, key_padding_mask).detach().cpu()
+            keys = F.normalize(values.float(), dim=-1).numpy().astype(np.float32)
+            values_np = values.float().numpy().astype(np.float32)
+            self._keys[h] = np.concatenate([self._keys[h], keys], axis=0)
+            self._values[h] = np.concatenate([self._values[h], values_np], axis=0)
 
     def build(self):
         """Finalise the bank; build FAISS indices if available."""
-        n = self._banks[0].shape[0]
-        print(f"  [RealVideoMemoryBank] Built with {n} real video embeddings per head.")
+        n = self._keys[0].shape[0]
+        print(f"  [RealVideoMemoryBank] Built with {n} real-video CLS prototypes per head.")
 
         if self._use_faiss:
             import faiss
             self._faiss_indices = []
             for h in range(self.num_heads):
                 index = faiss.IndexFlatIP(self.embed_dim)
-                index.add(self._banks[h])
+                index.add(self._keys[h])
                 self._faiss_indices.append(index)
 
     def __len__(self):
-        return self._banks[0].shape[0]
+        return self._keys[0].shape[0]
 
     # ── Querying ────────────────────────────────────────────────────────────
 
-    def query(self, video_feats_list: List[Tensor]) -> Tensor:
+    def query(
+        self,
+        video_feats_list: List[Tensor],
+        key_padding_mask: Optional[Tensor] = None,
+    ) -> List[Tensor]:
         """
         Query the bank for each video in the batch.
 
@@ -114,30 +137,38 @@ class RealVideoMemoryBank:
 
         Returns
         -------
-        sim_scores : (B, num_heads)  mean cosine sim to k nearest real neighbours
+        retrieved : list of num_heads tensors, each (B, embed_dim)
         """
-        B      = video_feats_list[0].size(0)
+        if len(self) == 0:
+            raise RuntimeError("RealVideoMemoryBank is empty; call add() and build() first.")
+
         device = video_feats_list[0].device
-        scores = []
+        dtype  = video_feats_list[0].dtype
+        retrieved = []
         k_eff  = min(self.k, len(self))
 
         for h, feats in enumerate(video_feats_list):
-            normed = F.normalize(feats.float(), dim=-1).detach().cpu()
+            pooled = self._mean_pool_valid(feats, key_padding_mask)
+            normed = F.normalize(pooled.float(), dim=-1).detach().cpu()
 
             if self._use_faiss:
-                sims, _ = self._faiss_indices[h].search(
+                sims, idx = self._faiss_indices[h].search(
                     normed.numpy().astype(np.float32), k_eff
                 )
-                mean_sim = torch.from_numpy(sims).mean(dim=1)
+                sims_t = torch.from_numpy(sims)
+                values = torch.from_numpy(self._values[h][idx])
             else:
-                bank     = torch.from_numpy(self._banks[h])
+                bank     = torch.from_numpy(self._keys[h])
                 sim      = normed @ bank.T
-                topk     = sim.topk(k_eff, dim=1).values
-                mean_sim = topk.mean(dim=1)
+                topk     = sim.topk(k_eff, dim=1)
+                sims_t   = topk.values
+                values   = torch.from_numpy(self._values[h])[topk.indices]
 
-            scores.append(mean_sim)
+            weights = torch.softmax(sims_t / self.temperature, dim=1).unsqueeze(-1)
+            memory_value = (weights * values).sum(dim=1)
+            retrieved.append(memory_value.to(device=device, dtype=dtype))
 
-        return torch.stack(scores, dim=1).to(device)   # (B, num_heads)
+        return retrieved
 
 
 # ---------------------------------------------------------------------------
@@ -294,20 +325,18 @@ class VideoViT(nn.Module):
     There is no fused_list / spatial_fused output and no separate "MACHead"
     in this backbone — the per-layer classification head is SpatialHead.
 
-    VideoViT adds one TemporalTransformer per tapped layer (4 total), then
-    fuses everything in a linear classifier.
+    VideoViT optionally gates frozen real-video memory prototypes into the
+    per-frame CLS sequences, then adds one TemporalTransformer per tapped layer
+    (4 total) and fuses everything in a linear classifier.
 
     Fusion inputs to fusion_classifier
     ------------------------------------
     temporal_vec      : concat of NUM_TEMPORAL_HEADS temporal outputs
                         (4 × 1024 = 4096)
-    frame_mean_logits : mean of deepest-layer (index 3) SpatialHead logits
-                        over valid frames (2)
-    real_sim_scores   : mean cosine sim to k nearest real videos, one per
-                        temporal head (4) — ONLY when memory_bank is set
+    memory_bank       : optional frozen real-video prototypes gated into CLS tokens
+                        before the temporal transformers
 
-    Without memory bank : fusion input dim = 4096 + 2      = 4098
-    With    memory bank : fusion input dim = 4096 + 2 + 4  = 4102
+    Fusion input dim = 4096, with or without memory.
 
     The memory_bank is NOT a nn.Module and is NOT in state_dict; it must be
     rebuilt and re-attached after loading a checkpoint.
@@ -328,6 +357,9 @@ class VideoViT(nn.Module):
         self.num_frames      = num_frames
         self.use_memory_bank = use_memory_bank
         self.memory_bank: Optional[RealVideoMemoryBank] = None
+        self.memory_gate = nn.Parameter(
+            torch.full((self.NUM_TEMPORAL_HEADS, 1, 1), -2.0)
+        ) if use_memory_bank else None
 
         self.frame_model = ViT()
 
@@ -342,9 +374,8 @@ class VideoViT(nn.Module):
             for _ in range(self.NUM_TEMPORAL_HEADS)
         ])
 
-        knn_dim = self.NUM_TEMPORAL_HEADS if use_memory_bank else 0
         self.fusion_classifier = nn.Linear(
-            self.NUM_TEMPORAL_HEADS * self.EMBED_DIM + 2 + knn_dim, 2
+            self.NUM_TEMPORAL_HEADS * self.EMBED_DIM, 2
         )
 
     # ── Compatibility alias (old code referenced model.vit) ─────────────────
@@ -392,45 +423,39 @@ class VideoViT(nn.Module):
         # ── Padding mask ────────────────────────────────────────────────────
         if lengths is None:
             key_padding_mask = None
-            valid_counts     = torch.full((B,), T, dtype=torch.float32, device=video.device)
         else:
             time_idx         = torch.arange(T, device=video.device).unsqueeze(0)  # (1, T)
             key_padding_mask = time_idx >= lengths.to(video.device).unsqueeze(1)  # (B, T)
-            valid_counts     = lengths.to(video.device).float()
-
-        # ── frame_mean_logits from deepest SpatialHead (index NUM_TEMPORAL_HEADS - 1 = 3) ──
-        # frame_logits_list[3] : (B*T, 2)  — deepest tap, layer 23
-        deepest_idx       = self.NUM_TEMPORAL_HEADS - 1
-        frame_logits_bt   = frame_logits_list[deepest_idx].reshape(B, T, 2).float()  # (B, T, 2)
-        if key_padding_mask is not None:
-            valid_mask        = (~key_padding_mask).float().unsqueeze(-1)          # (B, T, 1)
-            frame_logits_bt   = frame_logits_bt * valid_mask
-        frame_mean_logits = (
-            frame_logits_bt.sum(dim=1) /
-            valid_counts.unsqueeze(1).clamp(min=1)
-        )                                                                           # (B, 2)
 
         # ── Temporal transformers ────────────────────────────────────────────
         # cls_list[i] : (B*T, EMBED_DIM) — reshape to (B, T, EMBED_DIM)
+        cls_sequences = [
+            cls_tokens.reshape(B, T, self.EMBED_DIM) for cls_tokens in cls_list
+        ]
+
+        if self.use_memory_bank:
+            assert self.memory_bank is not None, (
+                "use_memory_bank=True but no bank attached. "
+                "Call attach_memory_bank() first."
+            )
+            memory_refs = self.memory_bank.query(cls_sequences, key_padding_mask)
+        else:
+            memory_refs = None
+
         video_feats_list = []
-        for temporal_tfm, cls_tokens in zip(self.temporal_transformers, cls_list):
-            frame_cls = cls_tokens.reshape(B, T, self.EMBED_DIM)                  # (B, T, D)
+        for h, (temporal_tfm, frame_cls) in enumerate(zip(self.temporal_transformers, cls_sequences)):
+            if memory_refs is not None:
+                gate = torch.sigmoid(self.memory_gate[h]).to(dtype=frame_cls.dtype)
+                memory_ref = memory_refs[h].unsqueeze(1)
+                frame_cls = (1 - gate) * frame_cls + gate * memory_ref
             if self.training:
                 frame_cls = temporal_augment(frame_cls, key_padding_mask)
             video_feats_list.append(temporal_tfm(frame_cls, key_padding_mask))    # (B, D)
 
         temporal_vec = torch.cat(video_feats_list, dim=1)                         # (B, 4*1024)
 
-        # ── Optional kNN real-video similarity ──────────────────────────────
-        if self.use_memory_bank:
-            assert self.memory_bank is not None, (
-                "use_memory_bank=True but no bank attached. "
-                "Call attach_memory_bank() first."
-            )
-            real_sim = self.memory_bank.query(video_feats_list)                   # (B, 4)
-            fused    = torch.cat([temporal_vec, frame_mean_logits, real_sim], dim=1)
-        else:
-            fused    = torch.cat([temporal_vec, frame_mean_logits], dim=1)        # (B, 4098)
+        # ── Fusion classifier input ──────────────────────────────
+        fused = temporal_vec                                                       # (B, 4096)
 
         video_logits = self.fusion_classifier(fused)                              # (B, 2)
 

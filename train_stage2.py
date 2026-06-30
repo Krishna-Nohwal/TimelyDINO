@@ -2,13 +2,12 @@
 train_stage2_4layers.py — Stage 2 of two-stage deepfake detection training.
 
 Loads the Stage 1 ViT (frame_model_4layers.py) checkpoint into VideoViT
-(video_vit_4layers.py), freezes frame_model entirely, and trains only the
+(video_model.py), freezes frame_model entirely, and trains only the
 temporal transformers and fusion_classifier on video-level data.
 
 Changes vs the 5-layer Stage 2 script
 ---------------------------------------
-* Imports VideoViT/RealVideoMemoryBank from video_vit_4layers (not
-  video_model_knn42).
+* Imports VideoViT/RealVideoMemoryBank from video_model.
 * frame_model_4layers.ViT taps 4 layers [20,21,22,23] → NUM_TEMPORAL_HEADS = 4
   temporal transformers (was 5).
 * cls_list entries are (B*T, 1024) f_cls tensors (already squeezed by
@@ -21,7 +20,9 @@ Changes vs the 5-layer Stage 2 script
   in VideoViT.forward; _video_probs_from_forward uses index 3 here.
 * load_image_weights in VideoViT handles both "bare Stage 1" and
   "full VideoViT" checkpoint formats automatically.
-* Memory bank is built with num_heads=4 (VideoViT.NUM_TEMPORAL_HEADS).
+* Memory bank is built with num_heads=4 (VideoViT.NUM_TEMPORAL_HEADS) from
+  frozen real-video CLS prototypes, then gated into CLS sequences before the
+  temporal transformers.
 
 Loss: BCE(video_logits) + lam * SupCon(video_feats per temporal head)
 Metrics: frame-level (frozen SpatialHeads) + video-level are reported.
@@ -59,7 +60,7 @@ from sklearn.metrics import (
     confusion_matrix, accuracy_score, f1_score,
 )
 from augmentations import augment_batch, load_and_resize, normalize
-from video_vit_4layers import VideoViT, RealVideoMemoryBank
+from video_model import VideoViT, RealVideoMemoryBank
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +90,7 @@ parser.add_argument("--lr",               default=1e-3, type=float,
 parser.add_argument("--warmup_steps",     default=64,   type=int)
 parser.add_argument("--supcon_weight",    default=1/16, type=float)
 parser.add_argument("--use_memory_bank",  action="store_true",
-                    help="Enable real-video kNN memory bank in fusion classifier.")
+                    help="Enable frozen real-video kNN memory gated before temporal transformers.")
 parser.add_argument("--knn_k",            default=32,   type=int,
                     help="Number of nearest real neighbours to retrieve.")
 parser.add_argument("--no_compile",       action="store_true",
@@ -528,10 +529,12 @@ def build_memory_bank(
     num_workers: int,
 ) -> RealVideoMemoryBank:
     """
-    Build a RealVideoMemoryBank from all real training videos.
+    Build a RealVideoMemoryBank from frozen CLS prototypes of all real
+    training videos.
 
-    Only real videos (label == 0) are stored.  Built once before training
-    because the frozen backbone produces identical embeddings every run.
+    Only real videos (label == 0) are stored. Built once before training
+    because the frozen frame backbone produces identical CLS embeddings every
+    run; the trainable temporal transformers are not used to build the bank.
 
     Returns
     -------
@@ -569,8 +572,9 @@ def build_memory_bank(
             frames  = frames.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
 
-            # Call frame_model and temporal transformers directly —
-            # do NOT call model() which would require the bank to already exist.
+            # Call frame_model directly.
+            # Temporal transformers are trainable and intentionally excluded
+            # from the stable memory-bank build.
             flat_frames = frames.reshape(B * T, C, H, W)
 
             # frame_model_4layers.ViT returns (logits_list, features_list, cls_list)
@@ -581,13 +585,13 @@ def build_memory_bank(
             time_idx         = torch.arange(T, device=device).unsqueeze(0)
             key_padding_mask = time_idx >= lengths.unsqueeze(1)
 
-            video_feats_list = []
-            for temporal_tfm, cls_tokens in zip(raw_model.temporal_transformers, cls_list):
+            cls_sequences = []
+            for cls_tokens in cls_list:
                 # cls_tokens : (B*T, EMBED_DIM) — reshape to (B, T, EMBED_DIM)
                 frame_cls = cls_tokens.reshape(B, T, raw_model.EMBED_DIM)
-                video_feats_list.append(temporal_tfm(frame_cls, key_padding_mask))
+                cls_sequences.append(frame_cls)
 
-            bank.add([v.float() for v in video_feats_list])
+            bank.add(cls_sequences, key_padding_mask)
 
     bank.build()
 
@@ -595,7 +599,7 @@ def build_memory_bank(
         model.train()
         raw_model.frame_model.eval()   # re-enforce frozen backbone eval mode
 
-    print(f"  Memory bank ready: {len(bank)} real video embeddings, k={k}")
+    print(f"  Memory bank ready: {len(bank)} frozen real-video CLS prototypes, k={k}")
     return bank
 
 
@@ -748,6 +752,8 @@ if __name__ == "__main__":
         train_frame_labels, train_frame_probs          = [], []
         train_video_labels                             = []
         train_video_mean_probs, train_video_temp_probs = [], []
+        gate_sum = gate_real_sum = gate_fake_sum = 0.0
+        gate_count = gate_real_count = gate_fake_count = 0
 
         for batch_idx, (frames, labels, lengths) in enumerate(
             tqdm(train_loader, desc=f"Epoch {epoch+1} [train]", leave=False)
@@ -759,6 +765,22 @@ if __name__ == "__main__":
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 video_logits, frame_logits_list, _, video_feats_list = model(frames, lengths)
                 loss = stage2_loss(video_logits, video_feats_list, labels, lam)
+
+            if args.use_memory_bank:
+                raw_gate_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                if raw_gate_model.memory_gate is not None:
+                    gate_avg = torch.sigmoid(raw_gate_model.memory_gate.detach()).mean().item()
+                    batch_n = labels.numel()
+                    real_n = (labels == 0).sum().item()
+                    fake_n = (labels == 1).sum().item()
+                    gate_sum += gate_avg * batch_n
+                    gate_count += batch_n
+                    if real_n:
+                        gate_real_sum += gate_avg * real_n
+                        gate_real_count += real_n
+                    if fake_n:
+                        gate_fake_sum += gate_avg * fake_n
+                        gate_fake_count += fake_n
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -783,6 +805,14 @@ if __name__ == "__main__":
 
         # ── Per-epoch metrics ────────────────────────────────────────────────
         print()
+        if args.use_memory_bank and gate_count:
+            gate_avg = gate_sum / gate_count
+            gate_real_avg = gate_real_sum / max(gate_real_count, 1)
+            gate_fake_avg = gate_fake_sum / max(gate_fake_count, 1)
+            print(
+                f"  Memory gate: avg={gate_avg:.4f}  "
+                f"real_avg={gate_real_avg:.4f}  fake_avg={gate_fake_avg:.4f}"
+            )
         compute_metrics(train_frame_labels,   train_frame_probs,     "Train (A) frame    ", epoch)
         compute_metrics(train_video_labels,   train_video_mean_probs, "Train (B) vid-mean ", epoch)
         compute_metrics(train_video_labels,   train_video_temp_probs, "Train (C) vid-temp ", epoch)
