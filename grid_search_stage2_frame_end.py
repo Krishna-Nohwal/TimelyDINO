@@ -7,7 +7,8 @@ training logs to the console, and also saves them under:
     checkpoints_s2_frame_end_grid/logs/
 
 By default this is intentionally small: four gate values, k=32, and 10 epochs
-per version. The first gate value is 0.13.
+per version. The first gate value is 0.13. Tqdm progress bars are disabled by
+default because they become noisy when logs are streamed through this launcher.
 
 Example
 -------
@@ -68,18 +69,28 @@ def format_value(value: float) -> str:
 
 def parse_log_summary(log_path: Path) -> dict:
     summary = {
-        "best_val_frame_end_auc": "",
-        "best_val_no_frame_auc": "",
+        "best_val_frame_end_w_mem_auc": "",
+        "best_val_frame_end_w_o_mem_auc": "",
+        "best_val_no_frame_w_mem_auc": "",
+        "best_val_no_frame_w_o_mem_auc": "",
         "best_val_epoch": "",
-        "last_test_frame_end_auc": "",
-        "last_test_no_frame_auc": "",
+        "last_test_frame_end_w_mem_auc": "",
+        "last_test_frame_end_w_o_mem_auc": "",
+        "last_test_no_frame_w_mem_auc": "",
+        "last_test_no_frame_w_o_mem_auc": "",
         "last_gate_avg": "",
     }
     val_re = re.compile(
-        r"\[Val AUC summary\]\s+frame in end=([0-9.]+)\s+no frame in end=([0-9.]+)"
+        r"\[Val AUC summary\]\s+frame-end w/ mem=([0-9.]+)\s+"
+        r"frame-end w/o mem=([0-9.]+)\s+"
+        r"no-frame w/ mem=([0-9.]+)\s+"
+        r"no-frame w/o mem=([0-9.]+)"
     )
     test_re = re.compile(
-        r"\[Test AUC summary\]\s+frame in end=([0-9.]+)\s+no frame in end=([0-9.]+)"
+        r"\[Test AUC summary\]\s+frame-end w/ mem=([0-9.]+)\s+"
+        r"frame-end w/o mem=([0-9.]+)\s+"
+        r"no-frame w/ mem=([0-9.]+)\s+"
+        r"no-frame w/o mem=([0-9.]+)"
     )
     epoch_re = re.compile(r"EPOCH\s+(\d+)/")
     gate_re = re.compile(r"Memory gate:\s+avg=([0-9.]+)")
@@ -102,14 +113,18 @@ def parse_log_summary(log_path: Path) -> dict:
                 val_frame = float(val_match.group(1))
                 if val_frame > best_val:
                     best_val = val_frame
-                    summary["best_val_frame_end_auc"] = val_match.group(1)
-                    summary["best_val_no_frame_auc"] = val_match.group(2)
+                    summary["best_val_frame_end_w_mem_auc"] = val_match.group(1)
+                    summary["best_val_frame_end_w_o_mem_auc"] = val_match.group(2)
+                    summary["best_val_no_frame_w_mem_auc"] = val_match.group(3)
+                    summary["best_val_no_frame_w_o_mem_auc"] = val_match.group(4)
                     summary["best_val_epoch"] = current_epoch
 
             test_match = test_re.search(line)
             if test_match:
-                summary["last_test_frame_end_auc"] = test_match.group(1)
-                summary["last_test_no_frame_auc"] = test_match.group(2)
+                summary["last_test_frame_end_w_mem_auc"] = test_match.group(1)
+                summary["last_test_frame_end_w_o_mem_auc"] = test_match.group(2)
+                summary["last_test_no_frame_w_mem_auc"] = test_match.group(3)
+                summary["last_test_no_frame_w_o_mem_auc"] = test_match.group(4)
 
     return summary
 
@@ -124,6 +139,7 @@ def run_trial(
     save_root: Path,
     log_dir: Path,
     passthrough_args: list[str],
+    disable_tqdm: bool,
     dry_run: bool,
 ) -> tuple[int, Path]:
     trial_save_root = save_root / run_name
@@ -139,6 +155,8 @@ def run_trial(
         "--save_root", str(trial_save_root),
         *passthrough_args,
     ]
+    if disable_tqdm:
+        cmd.append("--disable_tqdm")
 
     print("\n" + "=" * 80)
     print(f"FRAME-END GRID TRIAL: {run_name}")
@@ -176,6 +194,8 @@ def main():
     parser.add_argument("--epochs_per_trial", default=10, type=int)
     parser.add_argument("--gate_inits", default="0.13,0.20,0.35,0.50", type=str)
     parser.add_argument("--knn_k", default=32, type=int)
+    parser.add_argument("--show_progress_bars", action="store_true",
+                        help="Keep tqdm progress bars in streamed trial logs.")
     parser.add_argument("--dry_run", action="store_true")
     args, passthrough = parser.parse_known_args()
 
@@ -202,7 +222,8 @@ def main():
             save_root,
             log_dir,
             passthrough,
-            args.dry_run,
+            disable_tqdm=not args.show_progress_bars,
+            dry_run=args.dry_run,
         )
         if code != 0:
             failures.append((run_name, code))
@@ -225,15 +246,19 @@ def main():
             "knn_k",
             "epochs",
             "best_val_epoch",
-            "best_val_frame_end_auc",
-            "best_val_no_frame_auc",
-            "last_test_frame_end_auc",
-            "last_test_no_frame_auc",
+            "best_val_frame_end_w_mem_auc",
+            "best_val_frame_end_w_o_mem_auc",
+            "best_val_no_frame_w_mem_auc",
+            "best_val_no_frame_w_o_mem_auc",
+            "last_test_frame_end_w_mem_auc",
+            "last_test_frame_end_w_o_mem_auc",
+            "last_test_no_frame_w_mem_auc",
+            "last_test_no_frame_w_o_mem_auc",
             "last_gate_avg",
             "log_path",
         ]
         rows.sort(
-            key=lambda row: float(row["best_val_frame_end_auc"] or "-1"),
+            key=lambda row: float(row["best_val_frame_end_w_mem_auc"] or "-1"),
             reverse=True,
         )
         with open(summary_csv, "w", newline="") as f:
@@ -244,7 +269,8 @@ def main():
         print(
             f"\nBest by validation frame-end AUC: {best['run_name']} "
             f"at epoch {best['best_val_epoch']} "
-            f"(AUC={best['best_val_frame_end_auc']})"
+            f"(w/ mem AUC={best['best_val_frame_end_w_mem_auc']}, "
+            f"w/o mem AUC={best['best_val_frame_end_w_o_mem_auc']})"
         )
         print(f"Wrote summary: {summary_csv}")
 

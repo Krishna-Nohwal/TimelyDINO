@@ -45,6 +45,7 @@ python train_stage2_4layers.py \
 """
 
 import os, math, argparse
+from functools import partial
 import numpy as np
 import pandas as pd
 import torch
@@ -99,7 +100,12 @@ parser.add_argument("--memory_gate_init", default=0.13, type=float,
                     help="Initial sigmoid value for the learned memory gate.")
 parser.add_argument("--no_compile",       action="store_true",
                     help="Disable torch.compile (useful for debugging).")
+parser.add_argument("--disable_tqdm",     action="store_true",
+                    help="Disable tqdm progress bars for cleaner redirected/grid-search logs.")
 args = parser.parse_args()
+
+if args.disable_tqdm:
+    tqdm = partial(tqdm, disable=True)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +205,12 @@ class VideoViT(nn.Module):
         counts = valid.sum(dim=1).clamp(min=1)
         return ((frame_logits * valid).sum(dim=1) / counts).to(dtype=dtype)
 
-    def forward(self, video: Tensor, lengths: Optional[Tensor] = None):
+    def forward(
+        self,
+        video: Tensor,
+        lengths: Optional[Tensor] = None,
+        return_memory_ablation: bool = False,
+    ):
         B, T, C, H, W = video.shape
         if T > self.num_frames:
             raise ValueError(f"Expected <= {self.num_frames} frames, got {T}")
@@ -227,11 +238,24 @@ class VideoViT(nn.Module):
             memory_refs = None
 
         video_feats_list = []
+        no_memory_feats_list = [] if return_memory_ablation and memory_refs is not None else None
         for h, (temporal_tfm, frame_cls) in enumerate(zip(self.temporal_transformers, cls_sequences)):
+            no_memory_frame_cls = frame_cls
             if memory_refs is not None:
                 gate = torch.sigmoid(self.memory_gate[h]).to(dtype=frame_cls.dtype)
                 memory_ref = memory_refs[h].unsqueeze(1)
                 frame_cls = (1 - gate) * frame_cls + gate * memory_ref
+            if no_memory_feats_list is not None:
+                if self.training:
+                    with torch.no_grad():
+                        no_memory_aug = temporal_augment(no_memory_frame_cls, key_padding_mask)
+                        no_memory_feats_list.append(
+                            temporal_tfm(no_memory_aug, key_padding_mask)
+                        )
+                else:
+                    no_memory_feats_list.append(
+                        temporal_tfm(no_memory_frame_cls, key_padding_mask)
+                    )
             if self.training:
                 frame_cls = temporal_augment(frame_cls, key_padding_mask)
             video_feats_list.append(temporal_tfm(frame_cls, key_padding_mask))
@@ -246,6 +270,44 @@ class VideoViT(nn.Module):
 
         video_logits_with_frame = self.fusion_classifier(fused_with_frame)
         video_logits_no_frame = self.fusion_classifier(fused_no_frame)
+
+        if return_memory_ablation:
+            if no_memory_feats_list is None:
+                no_memory_logits_with_frame = video_logits_with_frame
+                no_memory_logits_no_frame = video_logits_no_frame
+            else:
+                no_memory_temporal_vec = torch.cat(no_memory_feats_list, dim=1)
+                no_memory_fused_with_frame = torch.cat(
+                    [no_memory_temporal_vec, frame_mean_logits], dim=1
+                )
+                no_memory_fused_no_frame = torch.cat(
+                    [no_memory_temporal_vec, torch.zeros_like(frame_mean_logits)], dim=1
+                )
+                if self.training:
+                    with torch.no_grad():
+                        no_memory_logits_with_frame = self.fusion_classifier(
+                            no_memory_fused_with_frame
+                        )
+                        no_memory_logits_no_frame = self.fusion_classifier(
+                            no_memory_fused_no_frame
+                        )
+                else:
+                    no_memory_logits_with_frame = self.fusion_classifier(
+                        no_memory_fused_with_frame
+                    )
+                    no_memory_logits_no_frame = self.fusion_classifier(
+                        no_memory_fused_no_frame
+                    )
+
+            return (
+                video_logits_with_frame,
+                video_logits_no_frame,
+                frame_logits_list,
+                frame_feats_list,
+                video_feats_list,
+                no_memory_logits_with_frame,
+                no_memory_logits_no_frame,
+            )
 
         return (
             video_logits_with_frame,
@@ -666,6 +728,7 @@ def run_eval(model: nn.Module, loader: DataLoader, desc: str):
     frame_labels_all, frame_probs_all = [], []
     video_labels_all = []
     video_mean_probs_all, video_with_frame_probs_all, video_no_frame_probs_all = [], [], []
+    video_no_memory_with_frame_probs_all, video_no_memory_no_frame_probs_all = [], []
 
     model.eval()
     with torch.inference_mode(), \
@@ -675,13 +738,27 @@ def run_eval(model: nn.Module, loader: DataLoader, desc: str):
             labels  = labels.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
 
-            (
-                video_logits_with_frame,
-                video_logits_no_frame,
-                frame_logits_list,
-                _,
-                _,
-            ) = model(frames, lengths)
+            outputs = model(frames, lengths, args.use_memory_bank)
+            if args.use_memory_bank:
+                (
+                    video_logits_with_frame,
+                    video_logits_no_frame,
+                    frame_logits_list,
+                    _,
+                    _,
+                    no_memory_logits_with_frame,
+                    no_memory_logits_no_frame,
+                ) = outputs
+            else:
+                (
+                    video_logits_with_frame,
+                    video_logits_no_frame,
+                    frame_logits_list,
+                    _,
+                    _,
+                ) = outputs
+                no_memory_logits_with_frame = video_logits_with_frame
+                no_memory_logits_no_frame = video_logits_no_frame
 
             fl, fp, vl, vmp, vwfp, vnfp = _video_probs_from_forward(
                 video_logits_with_frame,
@@ -690,17 +767,22 @@ def run_eval(model: nn.Module, loader: DataLoader, desc: str):
                 labels,
                 lengths,
             )
+            nm_wfp = torch.softmax(no_memory_logits_with_frame.float(), dim=1)[:, 1]
+            nm_nfp = torch.softmax(no_memory_logits_no_frame.float(), dim=1)[:, 1]
             frame_labels_all.extend(fl.cpu().numpy().tolist())
             frame_probs_all.extend(fp.cpu().numpy().tolist())
             video_labels_all.extend(vl.cpu().numpy().tolist())
             video_mean_probs_all.extend(vmp.cpu().numpy().tolist())
             video_with_frame_probs_all.extend(vwfp.cpu().numpy().tolist())
             video_no_frame_probs_all.extend(vnfp.cpu().numpy().tolist())
+            video_no_memory_with_frame_probs_all.extend(nm_wfp.cpu().numpy().tolist())
+            video_no_memory_no_frame_probs_all.extend(nm_nfp.cpu().numpy().tolist())
 
     return (
         frame_labels_all, frame_probs_all,
         video_labels_all, video_mean_probs_all,
         video_with_frame_probs_all, video_no_frame_probs_all,
+        video_no_memory_with_frame_probs_all, video_no_memory_no_frame_probs_all,
     )
 
 
@@ -940,6 +1022,7 @@ if __name__ == "__main__":
         train_frame_labels, train_frame_probs = [], []
         train_video_labels = []
         train_video_mean_probs, train_video_with_frame_probs, train_video_no_frame_probs = [], [], []
+        train_video_no_memory_with_frame_probs, train_video_no_memory_no_frame_probs = [], []
         gate_sum = gate_real_sum = gate_fake_sum = 0.0
         gate_count = gate_real_count = gate_fake_count = 0
 
@@ -951,13 +1034,27 @@ if __name__ == "__main__":
             lengths = lengths.to(device, non_blocking=True)
 
             with torch.cuda.amp.autocast(dtype=torch.float16):
-                (
-                    video_logits_with_frame,
-                    video_logits_no_frame,
-                    frame_logits_list,
-                    _,
-                    video_feats_list,
-                ) = model(frames, lengths)
+                outputs = model(frames, lengths, args.use_memory_bank)
+                if args.use_memory_bank:
+                    (
+                        video_logits_with_frame,
+                        video_logits_no_frame,
+                        frame_logits_list,
+                        _,
+                        video_feats_list,
+                        no_memory_logits_with_frame,
+                        no_memory_logits_no_frame,
+                    ) = outputs
+                else:
+                    (
+                        video_logits_with_frame,
+                        video_logits_no_frame,
+                        frame_logits_list,
+                        _,
+                        video_feats_list,
+                    ) = outputs
+                    no_memory_logits_with_frame = video_logits_with_frame
+                    no_memory_logits_no_frame = video_logits_no_frame
                 loss = stage2_loss(video_logits_with_frame, video_feats_list, labels, lam)
 
             if args.use_memory_bank:
@@ -992,12 +1089,16 @@ if __name__ == "__main__":
                     labels,
                     lengths,
                 )
+                nm_wfp = torch.softmax(no_memory_logits_with_frame.float(), dim=1)[:, 1]
+                nm_nfp = torch.softmax(no_memory_logits_no_frame.float(), dim=1)[:, 1]
             train_frame_labels.extend(fl.cpu().numpy().tolist())
             train_frame_probs.extend(fp.cpu().numpy().tolist())
             train_video_labels.extend(vl.cpu().numpy().tolist())
             train_video_mean_probs.extend(vmp.cpu().numpy().tolist())
             train_video_with_frame_probs.extend(vwfp.cpu().numpy().tolist())
             train_video_no_frame_probs.extend(vnfp.cpu().numpy().tolist())
+            train_video_no_memory_with_frame_probs.extend(nm_wfp.cpu().numpy().tolist())
+            train_video_no_memory_no_frame_probs.extend(nm_nfp.cpu().numpy().tolist())
 
             if batch_idx % 256 == 0:
                 print(f"  batch={batch_idx:4d}/{iter_per_epoch}  loss={loss.item():.4f}")
@@ -1014,32 +1115,80 @@ if __name__ == "__main__":
             )
         compute_metrics(train_frame_labels,   train_frame_probs,     "Train (A) frame    ", epoch)
         compute_metrics(train_video_labels,   train_video_mean_probs, "Train (B) vid-mean ", epoch)
-        compute_metrics(train_video_labels,   train_video_with_frame_probs, "Train (C) frame-end", epoch)
-        compute_metrics(train_video_labels,   train_video_no_frame_probs,   "Train (D) no-frame ", epoch)
+        if args.use_memory_bank:
+            compute_metrics(train_video_labels, train_video_with_frame_probs,
+                            "Train (C) frame-end w/ mem ", epoch)
+            compute_metrics(train_video_labels, train_video_no_frame_probs,
+                            "Train (D) no-frame  w/ mem ", epoch)
+            compute_metrics(train_video_labels, train_video_no_memory_with_frame_probs,
+                            "Train (E) frame-end w/o mem", epoch)
+            compute_metrics(train_video_labels, train_video_no_memory_no_frame_probs,
+                            "Train (F) no-frame  w/o mem", epoch)
+        else:
+            compute_metrics(train_video_labels, train_video_with_frame_probs,
+                            "Train (C) frame-end no mem", epoch)
+            compute_metrics(train_video_labels, train_video_no_frame_probs,
+                            "Train (D) no-frame  no mem", epoch)
 
-        val_fl, val_fp, val_vl, val_vmp, val_vwfp, val_vnfp = run_eval(
+        val_fl, val_fp, val_vl, val_vmp, val_vwfp, val_vnfp, val_nm_wfp, val_nm_nfp = run_eval(
             model, val_loader, f"Epoch {epoch+1} [val]"
         )
         compute_metrics(val_fl,  val_fp,  "Val   (A) frame    ", epoch)
         compute_metrics(val_vl,  val_vmp, "Val   (B) vid-mean ", epoch)
-        val_with_frame_auc = compute_metrics(val_vl, val_vwfp, "Val   (C) frame-end", epoch)
-        val_no_frame_auc   = compute_metrics(val_vl, val_vnfp, "Val   (D) no-frame ", epoch)
-        print(
-            f"  [Val AUC summary] frame in end={val_with_frame_auc:.4f}  "
-            f"no frame in end={val_no_frame_auc:.4f}"
-        )
+        if args.use_memory_bank:
+            val_with_frame_auc = compute_metrics(val_vl, val_vwfp,
+                                                 "Val   (C) frame-end w/ mem ", epoch)
+            val_no_frame_auc = compute_metrics(val_vl, val_vnfp,
+                                               "Val   (D) no-frame  w/ mem ", epoch)
+            val_no_mem_with_frame_auc = compute_metrics(val_vl, val_nm_wfp,
+                                                        "Val   (E) frame-end w/o mem", epoch)
+            val_no_mem_no_frame_auc = compute_metrics(val_vl, val_nm_nfp,
+                                                      "Val   (F) no-frame  w/o mem", epoch)
+            print(
+                f"  [Val AUC summary] frame-end w/ mem={val_with_frame_auc:.4f}  "
+                f"frame-end w/o mem={val_no_mem_with_frame_auc:.4f}  "
+                f"no-frame w/ mem={val_no_frame_auc:.4f}  "
+                f"no-frame w/o mem={val_no_mem_no_frame_auc:.4f}"
+            )
+        else:
+            val_with_frame_auc = compute_metrics(val_vl, val_vwfp,
+                                                 "Val   (C) frame-end no mem", epoch)
+            val_no_frame_auc = compute_metrics(val_vl, val_vnfp,
+                                               "Val   (D) no-frame  no mem", epoch)
+            print(
+                f"  [Val AUC summary] frame-end no mem={val_with_frame_auc:.4f}  "
+                f"no-frame no mem={val_no_frame_auc:.4f}"
+            )
 
-        cdf_fl, cdf_fp, cdf_vl, cdf_vmp, cdf_vwfp, cdf_vnfp = run_eval(
+        cdf_fl, cdf_fp, cdf_vl, cdf_vmp, cdf_vwfp, cdf_vnfp, cdf_nm_wfp, cdf_nm_nfp = run_eval(
             model, cdf_loader, f"Epoch {epoch+1} [CDFv1]"
         )
         compute_metrics(cdf_fl,  cdf_fp,  "Test  (A) frame    ", epoch)
         compute_metrics(cdf_vl,  cdf_vmp, "Test  (B) vid-mean ", epoch)
-        test_auc = compute_metrics(cdf_vl, cdf_vwfp, "Test  (C) frame-end", epoch)
-        test_no_frame_auc = compute_metrics(cdf_vl, cdf_vnfp, "Test  (D) no-frame ", epoch)
-        print(
-            f"  [Test AUC summary] frame in end={test_auc:.4f}  "
-            f"no frame in end={test_no_frame_auc:.4f}"
-        )
+        if args.use_memory_bank:
+            test_auc = compute_metrics(cdf_vl, cdf_vwfp,
+                                       "Test  (C) frame-end w/ mem ", epoch)
+            test_no_frame_auc = compute_metrics(cdf_vl, cdf_vnfp,
+                                                "Test  (D) no-frame  w/ mem ", epoch)
+            test_no_mem_with_frame_auc = compute_metrics(cdf_vl, cdf_nm_wfp,
+                                                         "Test  (E) frame-end w/o mem", epoch)
+            test_no_mem_no_frame_auc = compute_metrics(cdf_vl, cdf_nm_nfp,
+                                                       "Test  (F) no-frame  w/o mem", epoch)
+            print(
+                f"  [Test AUC summary] frame-end w/ mem={test_auc:.4f}  "
+                f"frame-end w/o mem={test_no_mem_with_frame_auc:.4f}  "
+                f"no-frame w/ mem={test_no_frame_auc:.4f}  "
+                f"no-frame w/o mem={test_no_mem_no_frame_auc:.4f}"
+            )
+        else:
+            test_auc = compute_metrics(cdf_vl, cdf_vwfp,
+                                       "Test  (C) frame-end no mem", epoch)
+            test_no_frame_auc = compute_metrics(cdf_vl, cdf_vnfp,
+                                                "Test  (D) no-frame  no mem", epoch)
+            print(
+                f"  [Test AUC summary] frame-end no mem={test_auc:.4f}  "
+                f"no-frame no mem={test_no_frame_auc:.4f}"
+            )
 
         # ── Checkpointing ────────────────────────────────────────────────────
         raw_model  = model._orig_mod if hasattr(model, "_orig_mod") else model
