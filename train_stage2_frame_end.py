@@ -44,7 +44,7 @@ python train_stage2_4layers.py \
     --batch_size  8
 """
 
-import os, math, argparse
+import os, math, argparse, csv
 from functools import partial
 import numpy as np
 import pandas as pd
@@ -102,6 +102,10 @@ parser.add_argument("--no_compile",       action="store_true",
                     help="Disable torch.compile (useful for debugging).")
 parser.add_argument("--disable_tqdm",     action="store_true",
                     help="Disable tqdm progress bars for cleaner redirected/grid-search logs.")
+parser.add_argument("--metrics_csv",      default="", type=str,
+                    help="Optional CSV path for grid-search metric summaries.")
+parser.add_argument("--run_name",         default="", type=str,
+                    help="Run name stored in --metrics_csv rows.")
 args = parser.parse_args()
 
 if args.disable_tqdm:
@@ -370,6 +374,35 @@ def compute_metrics(all_labels, all_probs, split_name: str, epoch: int) -> float
         f"TNR={tnr*100:.2f}%  TP={tp} FP={fp} FN={fn} TN={tn}"
     )
     return auc
+
+
+def write_grid_metric_rows(epoch: int, split: str, gate_avg, metrics: dict):
+    if not args.metrics_csv:
+        return
+
+    csv_path = Path(args.metrics_csv)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+    fieldnames = [
+        "run_name", "epoch", "split", "mode", "gate_init",
+        "knn_k", "gate_avg", "auc",
+    ]
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for mode, auc in metrics.items():
+            writer.writerow({
+                "run_name": args.run_name,
+                "epoch": epoch + 1,
+                "split": split,
+                "mode": mode,
+                "gate_init": args.memory_gate_init,
+                "knn_k": args.knn_k,
+                "gate_avg": gate_avg,
+                "auc": auc,
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -1105,10 +1138,12 @@ if __name__ == "__main__":
 
         # ── Per-epoch metrics ────────────────────────────────────────────────
         print()
+        epoch_gate_avg = ""
         if args.use_memory_bank and gate_count:
             gate_avg = gate_sum / gate_count
             gate_real_avg = gate_real_sum / max(gate_real_count, 1)
             gate_fake_avg = gate_fake_sum / max(gate_fake_count, 1)
+            epoch_gate_avg = gate_avg
             print(
                 f"  Memory gate: avg={gate_avg:.4f}  "
                 f"real_avg={gate_real_avg:.4f}  fake_avg={gate_fake_avg:.4f}"
@@ -1150,6 +1185,12 @@ if __name__ == "__main__":
                 f"no-frame w/ mem={val_no_frame_auc:.4f}  "
                 f"no-frame w/o mem={val_no_mem_no_frame_auc:.4f}"
             )
+            write_grid_metric_rows(epoch, "val", epoch_gate_avg, {
+                "frame_end_w_mem": val_with_frame_auc,
+                "frame_end_w_o_mem": val_no_mem_with_frame_auc,
+                "no_frame_w_mem": val_no_frame_auc,
+                "no_frame_w_o_mem": val_no_mem_no_frame_auc,
+            })
         else:
             val_with_frame_auc = compute_metrics(val_vl, val_vwfp,
                                                  "Val   (C) frame-end no mem", epoch)
@@ -1159,6 +1200,10 @@ if __name__ == "__main__":
                 f"  [Val AUC summary] frame-end no mem={val_with_frame_auc:.4f}  "
                 f"no-frame no mem={val_no_frame_auc:.4f}"
             )
+            write_grid_metric_rows(epoch, "val", epoch_gate_avg, {
+                "frame_end_no_mem": val_with_frame_auc,
+                "no_frame_no_mem": val_no_frame_auc,
+            })
 
         cdf_fl, cdf_fp, cdf_vl, cdf_vmp, cdf_vwfp, cdf_vnfp, cdf_nm_wfp, cdf_nm_nfp = run_eval(
             model, cdf_loader, f"Epoch {epoch+1} [CDFv1]"
@@ -1180,6 +1225,12 @@ if __name__ == "__main__":
                 f"no-frame w/ mem={test_no_frame_auc:.4f}  "
                 f"no-frame w/o mem={test_no_mem_no_frame_auc:.4f}"
             )
+            write_grid_metric_rows(epoch, "test", epoch_gate_avg, {
+                "frame_end_w_mem": test_auc,
+                "frame_end_w_o_mem": test_no_mem_with_frame_auc,
+                "no_frame_w_mem": test_no_frame_auc,
+                "no_frame_w_o_mem": test_no_mem_no_frame_auc,
+            })
         else:
             test_auc = compute_metrics(cdf_vl, cdf_vwfp,
                                        "Test  (C) frame-end no mem", epoch)
@@ -1189,6 +1240,10 @@ if __name__ == "__main__":
                 f"  [Test AUC summary] frame-end no mem={test_auc:.4f}  "
                 f"no-frame no mem={test_no_frame_auc:.4f}"
             )
+            write_grid_metric_rows(epoch, "test", epoch_gate_avg, {
+                "frame_end_no_mem": test_auc,
+                "no_frame_no_mem": test_no_frame_auc,
+            })
 
         # ── Checkpointing ────────────────────────────────────────────────────
         raw_model  = model._orig_mod if hasattr(model, "_orig_mod") else model
