@@ -56,7 +56,140 @@ from sklearn.metrics import (
 )
 
 from augmentations import load_and_resize, normalize
-from video_model_knn42 import VideoViT, RealVideoMemoryBank
+from frame_model import ViT
+from video_model import RealVideoMemoryBank, TemporalTransformer
+
+
+# ---------------------------------------------------------------------------
+# Frame-end Stage 2 model  (compatible with train_stage2_frame_end.py)
+# ---------------------------------------------------------------------------
+
+class VideoViT(torch.nn.Module):
+    """
+    Stage 2 frame-end video model.
+
+    The classifier receives 4 temporal heads (4 x 1024 = 4096 dims) plus
+    deepest-frame-head logits averaged over valid frames (2 dims).
+    """
+
+    EMBED_DIM = ViT.EMBED_DIM
+    NUM_TEMPORAL_HEADS = ViT.NUM_LAYERS
+
+    def __init__(
+        self,
+        num_frames: int = 32,
+        temporal_layers: int = 2,
+        temporal_heads: int = 8,
+        temporal_dropout: float = 0.1,
+        use_memory_bank: bool = False,
+    ):
+        super().__init__()
+        self.num_frames = num_frames
+        self.use_memory_bank = use_memory_bank
+        self.memory_bank = None
+        self.memory_gate = torch.nn.Parameter(
+            torch.full((self.NUM_TEMPORAL_HEADS, 1, 1), -2.0)
+        ) if use_memory_bank else None
+
+        self.frame_model = ViT()
+        self.temporal_transformers = torch.nn.ModuleList([
+            TemporalTransformer(
+                embed_dim=self.EMBED_DIM,
+                num_frames=num_frames,
+                num_layers=temporal_layers,
+                num_heads=temporal_heads,
+                dropout=temporal_dropout,
+            )
+            for _ in range(self.NUM_TEMPORAL_HEADS)
+        ])
+        self.fusion_classifier = torch.nn.Linear(
+            self.NUM_TEMPORAL_HEADS * self.EMBED_DIM + 2,
+            2,
+        )
+
+    @property
+    def vit(self):
+        return self.frame_model.vit
+
+    def attach_memory_bank(self, bank: RealVideoMemoryBank):
+        if not self.use_memory_bank:
+            raise RuntimeError("Model was not constructed with use_memory_bank=True.")
+        if bank.num_heads != self.NUM_TEMPORAL_HEADS:
+            raise ValueError(
+                f"Bank has {bank.num_heads} heads but model expects "
+                f"{self.NUM_TEMPORAL_HEADS}."
+            )
+        self.memory_bank = bank
+
+    @staticmethod
+    def _mean_valid_frame_logits(frame_logits_list, B, T, key_padding_mask, dtype):
+        frame_logits = frame_logits_list[-1].float().reshape(B, T, 2)
+        if key_padding_mask is None:
+            return frame_logits.mean(dim=1).to(dtype=dtype)
+
+        valid = (~key_padding_mask).float().unsqueeze(-1)
+        counts = valid.sum(dim=1).clamp(min=1)
+        return ((frame_logits * valid).sum(dim=1) / counts).to(dtype=dtype)
+
+    def forward(self, video: torch.Tensor, lengths=None):
+        B, T, C, H, W = video.shape
+        if T > self.num_frames:
+            raise ValueError(f"Expected <= {self.num_frames} frames, got {T}")
+
+        frames = video.reshape(B * T, C, H, W)
+        frame_logits_list, frame_feats_list, cls_list = self.frame_model(frames)
+
+        if lengths is None:
+            key_padding_mask = None
+        else:
+            time_idx = torch.arange(T, device=video.device).unsqueeze(0)
+            key_padding_mask = time_idx >= lengths.to(video.device).unsqueeze(1)
+
+        cls_sequences = [
+            cls_tokens.reshape(B, T, self.EMBED_DIM) for cls_tokens in cls_list
+        ]
+
+        if self.use_memory_bank:
+            if self.memory_bank is None:
+                raise RuntimeError(
+                    "use_memory_bank=True but no bank attached. "
+                    "Call attach_memory_bank() first."
+                )
+            memory_refs = self.memory_bank.query(cls_sequences, key_padding_mask)
+        else:
+            memory_refs = None
+
+        video_feats_list = []
+        for h, (temporal_tfm, frame_cls) in enumerate(
+            zip(self.temporal_transformers, cls_sequences)
+        ):
+            if memory_refs is not None:
+                gate = torch.sigmoid(self.memory_gate[h]).to(dtype=frame_cls.dtype)
+                memory_ref = memory_refs[h].unsqueeze(1)
+                frame_cls = (1 - gate) * frame_cls + gate * memory_ref
+            video_feats_list.append(temporal_tfm(frame_cls, key_padding_mask))
+
+        temporal_vec = torch.cat(video_feats_list, dim=1)
+        frame_mean_logits = self._mean_valid_frame_logits(
+            frame_logits_list, B, T, key_padding_mask, temporal_vec.dtype
+        )
+
+        fused_with_frame = torch.cat([temporal_vec, frame_mean_logits], dim=1)
+        fused_no_frame = torch.cat(
+            [temporal_vec, torch.zeros_like(frame_mean_logits)],
+            dim=1,
+        )
+
+        video_logits_with_frame = self.fusion_classifier(fused_with_frame)
+        video_logits_no_frame = self.fusion_classifier(fused_no_frame)
+
+        return (
+            video_logits_with_frame,
+            video_logits_no_frame,
+            frame_logits_list,
+            frame_feats_list,
+            video_feats_list,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +200,8 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Evaluate a Stage 2 VideoViT checkpoint on CDFv2."
     )
-    p.add_argument("--checkpoint",   required=True,
-                   help="Path to Stage 2 .pth checkpoint (full VideoViT state dict).")
+    p.add_argument("--checkpoint", default="frame_end_mem_gate0p13/best.pth",
+                   help="Path to Stage 2 frame-end .pth checkpoint.")
     p.add_argument("--fake_root",
                    default="/media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2",
                    help="Root dir containing per-frame fake sample dirs.")
@@ -108,9 +241,9 @@ def parse_args():
 
 IMG_SIZE = 256   # must match training
 
-# Deepest SpatialHead index in frame_42.ViT (5 tapped layers [19,20,21,22,23],
-# 0-based -> deepest = index 4, corresponding to layer 23).
-DEEPEST_HEAD_IDX = 4
+# Deepest SpatialHead index in frame_model.ViT (4 tapped layers [20,21,22,23],
+# 0-based -> deepest = index 3, corresponding to layer 23).
+DEEPEST_HEAD_IDX = 3
 
 
 # ---------------------------------------------------------------------------
@@ -318,8 +451,8 @@ def run_frame_inference(model: VideoViT, loader: DataLoader, device: torch.devic
         for imgs, labels, video_ids in tqdm(loader, desc="Frame inference", unit="batch"):
             imgs = imgs.to(device, non_blocking=True)
 
-            # frame_42.ViT returns (logits_list, features_list, cls_list, fused_list)
-            logits_list, _, _, _ = frame_model(imgs)
+            # frame_model.ViT returns (logits_list, features_list, cls_list)
+            logits_list, _, _ = frame_model(imgs)
             raw_logits = logits_list[DEEPEST_HEAD_IDX].float()       # (B, 2)
             probs      = torch.softmax(raw_logits, dim=1)[:, 1].cpu().numpy()
             fake_logit = raw_logits[:, 1].cpu().numpy()
@@ -380,11 +513,12 @@ def run_clip_inference(model: VideoViT, loader: DataLoader, device: torch.device
                        use_fp32: bool = False):
     """
     Full VideoViT forward pass through temporal transformers + fusion_classifier.
-    Returns (video_ids, video_labels, video_temp_probs).
+    Returns (video_ids, video_labels, video_frame_end_probs, video_no_frame_probs).
     """
     video_ids_out:    list = []
     video_labels_out: list = []
-    video_temp_probs: list = []
+    video_frame_end_probs: list = []
+    video_no_frame_probs: list = []
 
     autocast_ctx = (
         torch.autocast(device_type=device.type, dtype=torch.float16)
@@ -401,14 +535,20 @@ def run_clip_inference(model: VideoViT, loader: DataLoader, device: torch.device
             frames  = frames.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
 
-            video_logits, _, _, _ = model(frames, lengths)
-            probs = torch.softmax(video_logits.float(), dim=1)[:, 1].cpu().numpy()
+            video_logits_with_frame, video_logits_no_frame, _, _, _ = model(frames, lengths)
+            probs_with_frame = torch.softmax(
+                video_logits_with_frame.float(), dim=1
+            )[:, 1].cpu().numpy()
+            probs_no_frame = torch.softmax(
+                video_logits_no_frame.float(), dim=1
+            )[:, 1].cpu().numpy()
 
-            video_temp_probs.extend(probs.tolist())
+            video_frame_end_probs.extend(probs_with_frame.tolist())
+            video_no_frame_probs.extend(probs_no_frame.tolist())
             video_labels_out.extend(labels.numpy().tolist())
             video_ids_out.extend(vids)
 
-    return video_ids_out, video_labels_out, video_temp_probs
+    return video_ids_out, video_labels_out, video_frame_end_probs, video_no_frame_probs
 
 
 
@@ -516,7 +656,7 @@ def build_memory_bank_for_inference(
 
     bank = RealVideoMemoryBank(
         embed_dim = VideoViT.EMBED_DIM,
-        num_heads = VideoViT.NUM_TEMPORAL_HEADS,   # 5 (was VideoViT.NUM_HEADS = 4)
+        num_heads = VideoViT.NUM_TEMPORAL_HEADS,
         k         = k,
     )
 
@@ -539,24 +679,24 @@ def build_memory_bank_for_inference(
 
             # frame_42.ViT returns (logits_list, features_list, cls_list, fused_list)
             # cls_list[i] : (B*T, EMBED_DIM)  — f_cls, already squeezed
-            _, _, cls_list, _ = raw_model.frame_model(flat_frames)
+            _, _, cls_list = raw_model.frame_model(flat_frames)
 
             time_idx         = torch.arange(T, device=device).unsqueeze(0)
             key_padding_mask = time_idx >= lengths.unsqueeze(1)
 
-            video_feats_list = []
-            for temporal_tfm, cls_tokens in zip(raw_model.temporal_transformers, cls_list):
+            cls_sequences = []
+            for cls_tokens in cls_list:
                 frame_cls = cls_tokens.reshape(B, T, raw_model.EMBED_DIM)
-                video_feats_list.append(temporal_tfm(frame_cls, key_padding_mask))
+                cls_sequences.append(frame_cls)
 
-            bank.add([v.float() for v in video_feats_list])
+            bank.add(cls_sequences, key_padding_mask)
 
     bank.build()
 
     if was_training:
         model.train()
 
-    print(f"  Memory bank ready: {len(bank)} real video embeddings, k={k}")
+    print(f"  Memory bank ready: {len(bank)} real-video CLS prototypes, k={k}")
     return bank
 
 
@@ -576,15 +716,61 @@ def load_model(checkpoint_path: str, num_frames: int, device: torch.device) -> V
     which is a constant offset absorbed by the trained fusion_classifier weights.
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt = ckpt.get("state_dict", ckpt.get("model", ckpt))
     if any(k.startswith("_orig_mod.") for k in ckpt):
         ckpt = {k.replace("_orig_mod.", "", 1): v for k, v in ckpt.items()}
+
+    fc1_key = "frame_model.spatial_heads.0.head.0.weight"
+    if fc1_key in ckpt:
+        expected = (1024, 3072)
+        actual = tuple(ckpt[fc1_key].shape)
+        if actual != expected:
+            raise ValueError(
+                f"Checkpoint appears to be from a different model size.\n"
+                f"  Expected {fc1_key} shape : {expected}  (ViT-Large)\n"
+                f"  Got                      : {actual}"
+            )
+        print(f"  frame_model SpatialHead shape check passed {actual}")
+    else:
+        print(f"  [WARNING] Could not find '{fc1_key}' in checkpoint for shape check.")
+
+    fusion_key = "fusion_classifier.weight"
+    if fusion_key not in ckpt:
+        raise KeyError(
+            f"Cannot find '{fusion_key}' in checkpoint -- is this a VideoViT checkpoint?"
+        )
+    fusion_in_dim = ckpt[fusion_key].shape[1]
+    expected_fusion_dim = VideoViT.NUM_TEMPORAL_HEADS * VideoViT.EMBED_DIM + 2
+    if fusion_in_dim != expected_fusion_dim:
+        raise ValueError(
+            f"Unexpected fusion_classifier input dim {fusion_in_dim}. "
+            f"Expected {expected_fusion_dim} for frame-end model "
+            f"({VideoViT.NUM_TEMPORAL_HEADS}*{VideoViT.EMBED_DIM}+2)."
+        )
+
+    use_memory_bank = "memory_gate" in ckpt
+    print(f"  fusion_classifier input dim={fusion_in_dim} -> frame-end model")
+    print(f"  memory_gate present={use_memory_bank} -> use_memory_bank={use_memory_bank}")
+
+    model = VideoViT(
+        num_frames=num_frames,
+        use_memory_bank=use_memory_bank,
+    ).to(device)
+
+    missing, unexpected = model.load_state_dict(ckpt, strict=True)
+    if missing:
+        print(f"  [WARNING] Missing keys   : {missing[:5]}")
+    if unexpected:
+        print(f"  [WARNING] Unexpected keys: {unexpected[:5]}")
+    print("  Checkpoint loaded successfully.")
+    return model, use_memory_bank
 
     # Shape check on frame_model SpatialHead head[0] (frame_42.SpatialHead.head)
     # head : nn.Sequential(Linear(2*embed_dim, embed_dim//2), ReLU, Dropout)
     # so head.0.weight has shape (embed_dim//2, 2*embed_dim) = (512, 2048)
     fc1_key = "frame_model.spatial_heads.0.head.0.weight"
     if fc1_key in ckpt:
-        expected = (512, 2048)
+        expected = (1024, 3072)
         actual   = tuple(ckpt[fc1_key].shape)
         if actual != expected:
             raise ValueError(
@@ -662,7 +848,7 @@ def main():
     print(f"  Batch size  : {args.batch_size}  videos")
     print(f"  Top-k       : {args.topk}")
     print(f"  Precision   : {'FP32 (--fp32)' if args.fp32 else 'FP16 autocast'}")
-    print(f"  Temporal heads : {VideoViT.NUM_TEMPORAL_HEADS}  (frame_42.ViT, layers [19-23])")
+    print(f"  Temporal heads : {VideoViT.NUM_TEMPORAL_HEADS}  (frame_model.ViT, layers [20-23])")
     print(f"  Real bias   : {args.real_bias}"
           + ("  (disabled)" if args.real_bias == 0.0 else
              f"  -> exponent {1.0 + args.real_bias:.2f} applied to scores < 0.5"))
@@ -733,7 +919,7 @@ def main():
 
     # -- (C): clip / temporal inference --------------------------------------
     print("\n  Running clip-level (temporal) inference ...")
-    vid_ids_clip, vid_labels_clip, vid_temp_probs = run_clip_inference(
+    vid_ids_clip, vid_labels_clip, vid_frame_end_probs, vid_no_frame_probs = run_clip_inference(
         model, clip_loader, device, use_fp32=args.fp32,
     )
     print(f"  Total videos (temporal): {len(vid_ids_clip)}")
@@ -745,7 +931,8 @@ def main():
         vid_mean_probs  = apply_real_bias(vid_mean_probs,  args.real_bias)
         vid_mean_logits = apply_real_bias(vid_mean_logits, args.real_bias)
         vid_topk_mean   = apply_real_bias(vid_topk_mean,   args.real_bias)
-        vid_temp_probs  = apply_real_bias(vid_temp_probs,  args.real_bias)
+        vid_frame_end_probs = apply_real_bias(vid_frame_end_probs, args.real_bias)
+        vid_no_frame_probs  = apply_real_bias(vid_no_frame_probs,  args.real_bias)
         print(f"\n  Real-score bias applied (exponent={1.0 + args.real_bias:.2f}).")
 
     # -- Print metrics -------------------------------------------------------
@@ -765,9 +952,13 @@ def main():
         vid_labels_frame, vid_topk_mean,
         f"(B) Video-top{args.topk}-mean probs{bias_tag}  (CDFv2)"
     )
-    auc_temporal = compute_and_print_metrics(
-        vid_labels_clip, vid_temp_probs,
-        f"(C) Video-temporal (fusion){bias_tag}  (CDFv2)"
+    auc_frame_end = compute_and_print_metrics(
+        vid_labels_clip, vid_frame_end_probs,
+        f"(C) Video-temporal frame-end{bias_tag}  (CDFv2)"
+    )
+    auc_no_frame = compute_and_print_metrics(
+        vid_labels_clip, vid_no_frame_probs,
+        f"(D) Video-temporal no-frame{bias_tag}  (CDFv2)"
     )
 
     # -- Optional per-video CSV ----------------------------------------------
@@ -781,12 +972,18 @@ def main():
                 vid_mean_probs, vid_mean_logits, vid_topk_mean
             )
         }
-        clip_side = {vid: prob for vid, prob in zip(vid_ids_clip, vid_temp_probs)}
+        clip_frame_end = {
+            vid: prob for vid, prob in zip(vid_ids_clip, vid_frame_end_probs)
+        }
+        clip_no_frame = {
+            vid: prob for vid, prob in zip(vid_ids_clip, vid_no_frame_probs)
+        }
         rows = []
         for vid in sorted(frame_side.keys()):
             row = {"video_id": vid}
             row.update(frame_side[vid])
-            row["temporal_prob"] = clip_side.get(vid, float("nan"))
+            row["frame_end_prob"] = clip_frame_end.get(vid, float("nan"))
+            row["no_frame_prob"] = clip_no_frame.get(vid, float("nan"))
             rows.append(row)
         pd.DataFrame(rows).to_csv(args.save_results, index=False)
         print(f"\n  Per-video results written to: {args.save_results}")
@@ -799,7 +996,8 @@ def main():
     print(f"  (B) Video-mean probs AUC                   : {auc_mean_probs:.4f}")
     print(f"  (B) Video-mean logits->sigmoid AUC         : {auc_mean_logits:.4f}")
     print(f"  (B) Video-top{args.topk}-mean probs AUC          : {auc_topk:.4f}")
-    print(f"  (C) Video-temporal (fusion) AUC            : {auc_temporal:.4f}  <- primary")
+    print(f"  (C) Video-temporal frame-end AUC           : {auc_frame_end:.4f}  <- primary")
+    print(f"  (D) Video-temporal no-frame AUC            : {auc_no_frame:.4f}")
     print(f"  {sep}")
     print()
 
