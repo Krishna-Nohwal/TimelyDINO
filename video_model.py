@@ -385,13 +385,16 @@ class VideoViT(nn.Module):
         temporal_heads:   int   = 8,
         temporal_dropout: float = 0.1,
         use_memory_bank:  bool  = False,
+        memory_gate_init: float = 0.12,
     ):
         super().__init__()
         self.num_frames      = num_frames
         self.use_memory_bank = use_memory_bank
         self.memory_bank: Optional[RealVideoMemoryBank] = None
+        memory_gate_init = min(max(float(memory_gate_init), 1e-4), 1.0 - 1e-4)
+        memory_gate_logit = math.log(memory_gate_init / (1.0 - memory_gate_init))
         self.memory_gate = nn.Parameter(
-            torch.full((self.NUM_TEMPORAL_HEADS, 1, 1), -2.0)
+            torch.full((self.NUM_TEMPORAL_HEADS, 1, 1), memory_gate_logit)
         ) if use_memory_bank else None
 
         self.frame_model = ViT()
@@ -462,7 +465,12 @@ class VideoViT(nn.Module):
 
     # ── Forward ─────────────────────────────────────────────────────────────
 
-    def forward(self, video: Tensor, lengths: Optional[Tensor] = None):
+    def forward(
+        self,
+        video: Tensor,
+        lengths: Optional[Tensor] = None,
+        return_memory_ablation: bool = False,
+    ):
         """
         Args
         ----
@@ -521,9 +529,20 @@ class VideoViT(nn.Module):
             memory_refs = None
 
         video_feats_list = []
+        no_memory_feats_list = [] if return_memory_ablation and memory_refs is not None else None
         for h, (temporal_tfm, x, full_padding_mask) in enumerate(
             zip(self.temporal_transformers, first_outputs, full_masks)
         ):
+            if no_memory_feats_list is not None:
+                if self.training:
+                    with torch.no_grad():
+                        no_memory_feats_list.append(
+                            temporal_tfm.finish_from_first(x, full_padding_mask)
+                        )
+                else:
+                    no_memory_feats_list.append(
+                        temporal_tfm.finish_from_first(x, full_padding_mask)
+                    )
             if memory_refs is not None:
                 gate = torch.sigmoid(self.memory_gate[h]).to(dtype=x.dtype)
                 memory_ref = memory_refs[h].unsqueeze(1)
@@ -533,6 +552,24 @@ class VideoViT(nn.Module):
 
         temporal_vec = torch.cat(video_feats_list, dim=1)
         video_logits = self.fusion_classifier(temporal_vec)
+
+        if return_memory_ablation:
+            if no_memory_feats_list is None:
+                no_memory_logits = video_logits
+            else:
+                no_memory_vec = torch.cat(no_memory_feats_list, dim=1)
+                if self.training:
+                    with torch.no_grad():
+                        no_memory_logits = self.fusion_classifier(no_memory_vec)
+                else:
+                    no_memory_logits = self.fusion_classifier(no_memory_vec)
+            return (
+                video_logits,
+                frame_logits_list,
+                frame_feats_list,
+                video_feats_list,
+                no_memory_logits,
+            )
 
         return video_logits, frame_logits_list, frame_feats_list, video_feats_list
 

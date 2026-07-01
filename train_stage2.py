@@ -44,7 +44,7 @@ python train_stage2_4layers.py \
     --batch_size  8
 """
 
-import os, math, argparse
+import os, math, argparse, csv
 import numpy as np
 import pandas as pd
 import torch
@@ -93,6 +93,14 @@ parser.add_argument("--use_memory_bank",  action="store_true",
                     help="Enable real-video kNN memory after temporal layer 1, rebuilt every epoch.")
 parser.add_argument("--knn_k",            default=32,   type=int,
                     help="Number of nearest real neighbours to retrieve.")
+parser.add_argument("--memory_gate_init", default=0.12, type=float,
+                    help="Initial sigmoid value for the learned memory gate.")
+parser.add_argument("--memory_gate_lr_mult", default=1.0, type=float,
+                    help="LR multiplier for memory_gate relative to --lr.")
+parser.add_argument("--metrics_csv",      default="",   type=str,
+                    help="Optional per-epoch metrics CSV for ablations/grid search.")
+parser.add_argument("--run_name",         default="",   type=str,
+                    help="Name stored in --metrics_csv rows.")
 parser.add_argument("--no_compile",       action="store_true",
                     help="Disable torch.compile (useful for debugging).")
 args = parser.parse_args()
@@ -110,12 +118,54 @@ torch.backends.cudnn.benchmark = True
 
 print(f"Using device: {device}")
 
+_metrics_file = None
+_metrics_writer = None
+_last_gate_stats = {
+    "gate_avg": "",
+    "gate_real_avg": "",
+    "gate_fake_avg": "",
+}
+
+
+def init_metrics_csv(path: str):
+    global _metrics_file, _metrics_writer
+    if not path:
+        return
+
+    csv_path = Path(path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+    _metrics_file = open(csv_path, "a", newline="")
+    fieldnames = [
+        "run_name", "epoch", "split_name", "mode", "gate_init",
+        "gate_lr_mult", "knn_k", "use_memory_bank", "gate_avg",
+        "gate_real_avg", "gate_fake_avg", "auc", "ap", "acc", "f1",
+        "eer", "tpr", "fpr", "tnr", "tp", "fp", "fn", "tn",
+    ]
+    _metrics_writer = csv.DictWriter(_metrics_file, fieldnames=fieldnames)
+    if not file_exists:
+        _metrics_writer.writeheader()
+
+
+def close_metrics_csv():
+    global _metrics_file, _metrics_writer
+    if _metrics_file is not None:
+        _metrics_file.close()
+    _metrics_file = None
+    _metrics_writer = None
+
 
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_metrics(all_labels, all_probs, split_name: str, epoch: int) -> float:
+def compute_metrics(
+    all_labels,
+    all_probs,
+    split_name: str,
+    epoch: int,
+    mode: str = "",
+) -> dict:
     all_labels = np.array(all_labels)
     all_probs  = np.array(all_probs)
     all_preds  = (all_probs >= 0.5).astype(int)
@@ -142,7 +192,38 @@ def compute_metrics(all_labels, all_probs, split_name: str, epoch: int) -> float
         f"EER={eer*100:.2f}%  TPR={tpr*100:.2f}%  FPR={fpr*100:.2f}%  "
         f"TNR={tnr*100:.2f}%  TP={tp} FP={fp} FN={fn} TN={tn}"
     )
-    return auc
+    metrics = {
+        "auc": auc,
+        "ap": ap,
+        "acc": acc,
+        "f1": f1,
+        "eer": eer,
+        "tpr": tpr,
+        "fpr": fpr,
+        "tnr": tnr,
+        "tp": int(tp),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tn": int(tn),
+    }
+
+    if _metrics_writer is not None:
+        row = {
+            "run_name": args.run_name,
+            "epoch": epoch + 1,
+            "split_name": split_name.strip(),
+            "mode": mode,
+            "gate_init": args.memory_gate_init,
+            "gate_lr_mult": args.memory_gate_lr_mult,
+            "knn_k": args.knn_k,
+            "use_memory_bank": int(args.use_memory_bank),
+            **_last_gate_stats,
+            **metrics,
+        }
+        _metrics_writer.writerow(row)
+        _metrics_file.flush()
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -487,11 +568,13 @@ def run_eval(model: nn.Module, loader: DataLoader, desc: str):
 
     Returns
     -------
-    (frame_labels, frame_probs, video_labels, video_mean_probs, video_temp_probs)
+    (frame_labels, frame_probs, video_labels, video_mean_probs, video_temp_probs,
+     video_no_mem_probs)
     """
     frame_labels_all, frame_probs_all          = [], []
     video_labels_all                           = []
     video_mean_probs_all, video_temp_probs_all = [], []
+    video_no_mem_probs_all                     = []
 
     model.eval()
     with torch.inference_mode(), \
@@ -501,20 +584,28 @@ def run_eval(model: nn.Module, loader: DataLoader, desc: str):
             labels  = labels.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
 
-            video_logits, frame_logits_list, _, _ = model(frames, lengths)
+            outputs = model(frames, lengths, args.use_memory_bank)
+            if args.use_memory_bank:
+                video_logits, frame_logits_list, _, _, no_mem_logits = outputs
+            else:
+                video_logits, frame_logits_list, _, _ = outputs
+                no_mem_logits = video_logits
 
             fl, fp, vl, vmp, vtp = _video_probs_from_forward(
                 video_logits, frame_logits_list, labels, lengths
             )
+            vnp = torch.softmax(no_mem_logits.float(), dim=1)[:, 1]
             frame_labels_all.extend(fl.cpu().numpy().tolist())
             frame_probs_all.extend(fp.cpu().numpy().tolist())
             video_labels_all.extend(vl.cpu().numpy().tolist())
             video_mean_probs_all.extend(vmp.cpu().numpy().tolist())
             video_temp_probs_all.extend(vtp.cpu().numpy().tolist())
+            video_no_mem_probs_all.extend(vnp.cpu().numpy().tolist())
 
     return (
         frame_labels_all, frame_probs_all,
         video_labels_all, video_mean_probs_all, video_temp_probs_all,
+        video_no_mem_probs_all,
     )
 
 
@@ -621,6 +712,7 @@ def build_memory_bank(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    init_metrics_csv(args.metrics_csv)
 
     SEP = "=" * 80
     print(f"\n{SEP}")
@@ -685,6 +777,7 @@ if __name__ == "__main__":
     model = VideoViT(
         num_frames      = NUM_FRAMES,
         use_memory_bank = args.use_memory_bank,
+        memory_gate_init = args.memory_gate_init,
     ).to(device)
 
     print(f"Loading Stage 1 weights from: {args.load_from}")
@@ -705,6 +798,8 @@ if __name__ == "__main__":
         f"  temporal_transformers:    TRAINABLE  ({VideoViT.NUM_TEMPORAL_HEADS} heads)\n"
         f"  fusion_classifier:        TRAINABLE\n"
         f"  memory_bank:              {'ENABLED' if args.use_memory_bank else 'DISABLED'}\n"
+        f"  memory_gate_init:         {args.memory_gate_init:.4f}\n"
+        f"  memory_gate_lr_mult:      {args.memory_gate_lr_mult:.2f}\n"
         f"  Trainable params: {trainable_n:,} / {total_n:,} "
         f"({100*trainable_n/total_n:.1f}%)\n"
     )
@@ -738,7 +833,19 @@ if __name__ == "__main__":
         for i in range(total_steps)
     }
 
-    optimizer = optim.AdamW(trainable, lr=lr_base, weight_decay=1e-2)
+    raw_for_optim = model._orig_mod if hasattr(model, "_orig_mod") else model
+    gate_params = []
+    if args.use_memory_bank and raw_for_optim.memory_gate is not None:
+        gate_params = [raw_for_optim.memory_gate]
+    gate_param_ids = {id(p) for p in gate_params}
+    base_params = [p for p in trainable if id(p) not in gate_param_ids]
+    param_groups = [{"params": base_params, "lr": lr_base}]
+    if gate_params:
+        param_groups.append({
+            "params": gate_params,
+            "lr": lr_base * args.memory_gate_lr_mult,
+        })
+    optimizer = optim.AdamW(param_groups, lr=lr_base, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda step: lr_dict[step]
     )
@@ -769,6 +876,7 @@ if __name__ == "__main__":
         train_frame_labels, train_frame_probs          = [], []
         train_video_labels                             = []
         train_video_mean_probs, train_video_temp_probs = [], []
+        train_video_no_mem_probs                       = []
         gate_sum = gate_real_sum = gate_fake_sum = 0.0
         gate_count = gate_real_count = gate_fake_count = 0
 
@@ -780,7 +888,12 @@ if __name__ == "__main__":
             lengths = lengths.to(device, non_blocking=True)
 
             with torch.cuda.amp.autocast(dtype=torch.float16):
-                video_logits, frame_logits_list, _, video_feats_list = model(frames, lengths)
+                outputs = model(frames, lengths, args.use_memory_bank)
+                if args.use_memory_bank:
+                    video_logits, frame_logits_list, _, video_feats_list, no_mem_logits = outputs
+                else:
+                    video_logits, frame_logits_list, _, video_feats_list = outputs
+                    no_mem_logits = video_logits
                 loss = stage2_loss(video_logits, video_feats_list, labels, lam)
 
             if args.use_memory_bank:
@@ -811,11 +924,13 @@ if __name__ == "__main__":
                 fl, fp, vl, vmp, vtp = _video_probs_from_forward(
                     video_logits, frame_logits_list, labels, lengths
                 )
+                vnp = torch.softmax(no_mem_logits.float(), dim=1)[:, 1]
             train_frame_labels.extend(fl.cpu().numpy().tolist())
             train_frame_probs.extend(fp.cpu().numpy().tolist())
             train_video_labels.extend(vl.cpu().numpy().tolist())
             train_video_mean_probs.extend(vmp.cpu().numpy().tolist())
             train_video_temp_probs.extend(vtp.cpu().numpy().tolist())
+            train_video_no_mem_probs.extend(vnp.cpu().numpy().tolist())
 
             if batch_idx % 256 == 0:
                 print(f"  batch={batch_idx:4d}/{iter_per_epoch}  loss={loss.item():.4f}")
@@ -826,27 +941,75 @@ if __name__ == "__main__":
             gate_avg = gate_sum / gate_count
             gate_real_avg = gate_real_sum / max(gate_real_count, 1)
             gate_fake_avg = gate_fake_sum / max(gate_fake_count, 1)
+            _last_gate_stats = {
+                "gate_avg": gate_avg,
+                "gate_real_avg": gate_real_avg,
+                "gate_fake_avg": gate_fake_avg,
+            }
             print(
                 f"  Memory gate: avg={gate_avg:.4f}  "
                 f"real_avg={gate_real_avg:.4f}  fake_avg={gate_fake_avg:.4f}"
             )
-        compute_metrics(train_frame_labels,   train_frame_probs,     "Train (A) frame    ", epoch)
-        compute_metrics(train_video_labels,   train_video_mean_probs, "Train (B) vid-mean ", epoch)
-        compute_metrics(train_video_labels,   train_video_temp_probs, "Train (C) vid-temp ", epoch)
+        else:
+            _last_gate_stats = {
+                "gate_avg": "",
+                "gate_real_avg": "",
+                "gate_fake_avg": "",
+            }
+        compute_metrics(train_frame_labels, train_frame_probs,
+                        "Train (A) frame          ", epoch, mode="frame")
+        compute_metrics(train_video_labels, train_video_mean_probs,
+                        "Train (B) vid-mean       ", epoch, mode="vid_mean")
+        if args.use_memory_bank:
+            compute_metrics(train_video_labels, train_video_temp_probs,
+                            "Train (C) vid-temp w/ mem", epoch, mode="with_memory")
+            compute_metrics(train_video_labels, train_video_no_mem_probs,
+                            "Train (D) vid-temp w/o mem", epoch, mode="without_memory")
+        else:
+            compute_metrics(train_video_labels, train_video_temp_probs,
+                            "Train (C) vid-temp no mem", epoch, mode="without_memory")
 
-        val_fl, val_fp, val_vl, val_vmp, val_vtp = run_eval(
+        val_fl, val_fp, val_vl, val_vmp, val_vtp, val_vnp = run_eval(
             model, val_loader, f"Epoch {epoch+1} [val]"
         )
-        compute_metrics(val_fl,  val_fp,  "Val   (A) frame    ", epoch)
-        compute_metrics(val_vl,  val_vmp, "Val   (B) vid-mean ", epoch)
-        compute_metrics(val_vl,  val_vtp, "Val   (C) vid-temp ", epoch)
+        compute_metrics(val_fl, val_fp,
+                        "Val   (A) frame          ", epoch, mode="frame")
+        compute_metrics(val_vl, val_vmp,
+                        "Val   (B) vid-mean       ", epoch, mode="vid_mean")
+        if args.use_memory_bank:
+            val_mem_metrics = compute_metrics(val_vl, val_vtp,
+                                              "Val   (C) vid-temp w/ mem", epoch, mode="with_memory")
+            val_no_mem_metrics = compute_metrics(val_vl, val_vnp,
+                                                 "Val   (D) vid-temp w/o mem", epoch, mode="without_memory")
+        else:
+            val_mem_metrics = compute_metrics(val_vl, val_vtp,
+                                              "Val   (C) vid-temp no mem", epoch, mode="without_memory")
+            val_no_mem_metrics = val_mem_metrics
 
-        cdf_fl, cdf_fp, cdf_vl, cdf_vmp, cdf_vtp = run_eval(
+        cdf_fl, cdf_fp, cdf_vl, cdf_vmp, cdf_vtp, cdf_vnp = run_eval(
             model, cdf_loader, f"Epoch {epoch+1} [CDFv1]"
         )
-        compute_metrics(cdf_fl,  cdf_fp,  "Test  (A) frame    ", epoch)
-        compute_metrics(cdf_vl,  cdf_vmp, "Test  (B) vid-mean ", epoch)
-        test_auc = compute_metrics(cdf_vl, cdf_vtp, "Test  (C) vid-temp ", epoch)
+        compute_metrics(cdf_fl, cdf_fp,
+                        "Test  (A) frame          ", epoch, mode="frame")
+        compute_metrics(cdf_vl, cdf_vmp,
+                        "Test  (B) vid-mean       ", epoch, mode="vid_mean")
+        if args.use_memory_bank:
+            test_metrics = compute_metrics(cdf_vl, cdf_vtp,
+                                           "Test  (C) vid-temp w/ mem", epoch, mode="with_memory")
+            test_no_mem_metrics = compute_metrics(cdf_vl, cdf_vnp,
+                                                  "Test  (D) vid-temp w/o mem", epoch, mode="without_memory")
+        else:
+            test_metrics = compute_metrics(cdf_vl, cdf_vtp,
+                                           "Test  (C) vid-temp no mem", epoch, mode="without_memory")
+            test_no_mem_metrics = test_metrics
+        test_auc = test_metrics["auc"]
+
+        if args.use_memory_bank:
+            print(
+                f"  Ablation delta (w/ mem - w/o mem): "
+                f"Val AUC={val_mem_metrics['auc'] - val_no_mem_metrics['auc']:+.4f}, "
+                f"Test AUC={test_metrics['auc'] - test_no_mem_metrics['auc']:+.4f}"
+            )
 
         # ── Checkpointing ────────────────────────────────────────────────────
         raw_model  = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -867,3 +1030,4 @@ if __name__ == "__main__":
     print(f"  Best checkpoint: epoch {best_epoch+1}  Test video AUC={best_test_auc:.4f}")
     print(f"  Saved to: {os.path.join(args.save_root, 'best.pth')}")
     print(SEP)
+    close_metrics_csv()

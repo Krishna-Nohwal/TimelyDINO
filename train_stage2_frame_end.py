@@ -95,6 +95,8 @@ parser.add_argument("--use_memory_bank",  action="store_true",
                     help="Enable frozen real-video kNN memory gated before temporal transformers.")
 parser.add_argument("--knn_k",            default=32,   type=int,
                     help="Number of nearest real neighbours to retrieve.")
+parser.add_argument("--memory_gate_init", default=0.13, type=float,
+                    help="Initial sigmoid value for the learned memory gate.")
 parser.add_argument("--no_compile",       action="store_true",
                     help="Disable torch.compile (useful for debugging).")
 args = parser.parse_args()
@@ -139,13 +141,16 @@ class VideoViT(nn.Module):
         temporal_heads:   int   = 8,
         temporal_dropout: float = 0.1,
         use_memory_bank:  bool  = False,
+        memory_gate_init: float = 0.13,
     ):
         super().__init__()
         self.num_frames      = num_frames
         self.use_memory_bank = use_memory_bank
         self.memory_bank: Optional[RealVideoMemoryBank] = None
+        memory_gate_init = min(max(float(memory_gate_init), 1e-4), 1.0 - 1e-4)
+        memory_gate_logit = math.log(memory_gate_init / (1.0 - memory_gate_init))
         self.memory_gate = nn.Parameter(
-            torch.full((self.NUM_TEMPORAL_HEADS, 1, 1), -2.0)
+            torch.full((self.NUM_TEMPORAL_HEADS, 1, 1), memory_gate_logit)
         ) if use_memory_bank else None
 
         self.frame_model = ViT()
@@ -853,6 +858,7 @@ if __name__ == "__main__":
     model = VideoViT(
         num_frames      = NUM_FRAMES,
         use_memory_bank = args.use_memory_bank,
+        memory_gate_init = args.memory_gate_init,
     ).to(device)
 
     print(f"Loading Stage 1 weights from: {args.load_from}")
@@ -873,6 +879,7 @@ if __name__ == "__main__":
         f"  temporal_transformers:    TRAINABLE  ({VideoViT.NUM_TEMPORAL_HEADS} heads)\n"
         f"  fusion_classifier:        TRAINABLE  (4096 temporal + 2 mean frame logits)\n"
         f"  memory_bank:              {'ENABLED' if args.use_memory_bank else 'DISABLED'}\n"
+        f"  memory_gate_init:         {args.memory_gate_init:.4f}\n"
         f"  Trainable params: {trainable_n:,} / {total_n:,} "
         f"({100*trainable_n/total_n:.1f}%)\n"
     )
