@@ -1234,7 +1234,7 @@ def load_model(checkpoint_path: str, num_frames: int, device: torch.device) -> V
 
     fc1_key = "frame_model.spatial_heads.0.head.0.weight"
     if fc1_key in ckpt:
-        expected = (512, 2048)
+        expected = (1024, 3072)
         actual = tuple(ckpt[fc1_key].shape)
         if actual != expected:
             raise ValueError(
@@ -1282,7 +1282,7 @@ def load_model(checkpoint_path: str, num_frames: int, device: torch.device) -> V
     # so head.0.weight has shape (embed_dim//2, 2*embed_dim) = (512, 2048)
     fc1_key = "frame_model.spatial_heads.0.head.0.weight"
     if fc1_key in ckpt:
-        expected = (512, 2048)
+        expected = (1024, 3072)
         actual   = tuple(ckpt[fc1_key].shape)
         if actual != expected:
             raise ValueError(
