@@ -90,7 +90,7 @@ parser.add_argument("--lr",               default=1e-3, type=float,
 parser.add_argument("--warmup_steps",     default=64,   type=int)
 parser.add_argument("--supcon_weight",    default=1/16, type=float)
 parser.add_argument("--use_memory_bank",  action="store_true",
-                    help="Enable frozen real-video kNN memory gated before temporal transformers.")
+                    help="Enable real-video kNN memory after temporal layer 1, rebuilt every epoch.")
 parser.add_argument("--knn_k",            default=32,   type=int,
                     help="Number of nearest real neighbours to retrieve.")
 parser.add_argument("--no_compile",       action="store_true",
@@ -529,18 +529,21 @@ def build_memory_bank(
     num_workers: int,
 ) -> RealVideoMemoryBank:
     """
-    Build a RealVideoMemoryBank from frozen CLS prototypes of all real
+    Build a RealVideoMemoryBank from temporal layer-1 prototypes of all real
     training videos.
 
-    Only real videos (label == 0) are stored. Built once before training
-    because the frozen frame backbone produces identical CLS embeddings every
-    run; the trainable temporal transformers are not used to build the bank.
+    Only real videos (label == 0) are stored. Rebuild once per epoch because
+    the first temporal layer is trainable and its embedding space moves.
 
     Returns
     -------
     bank : RealVideoMemoryBank  ready for model.attach_memory_bank()
     """
     print("Building real-video memory bank …")
+
+    old_augment = getattr(train_dataset, "augment", None)
+    if old_augment is not None:
+        train_dataset.augment = False
 
     real_indices = [i for i, (_, label) in enumerate(train_dataset.videos) if label == 0]
     real_subset  = torch.utils.data.Subset(train_dataset, real_indices)
@@ -572,6 +575,13 @@ def build_memory_bank(
             frames  = frames.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
 
+            memory_sequences, key_padding_mask = raw_model.memory_features_for_bank(
+                frames,
+                lengths,
+            )
+            bank.add(memory_sequences, key_padding_mask)
+            continue
+
             # Call frame_model directly.
             # Temporal transformers are trainable and intentionally excluded
             # from the stable memory-bank build.
@@ -599,7 +609,10 @@ def build_memory_bank(
         model.train()
         raw_model.frame_model.eval()   # re-enforce frozen backbone eval mode
 
-    print(f"  Memory bank ready: {len(bank)} frozen real-video CLS prototypes, k={k}")
+    if old_augment is not None:
+        train_dataset.augment = old_augment
+
+    print(f"  Memory bank ready: {len(bank)} real-video layer-1 prototypes, k={k}")
     return bank
 
 
@@ -698,8 +711,7 @@ if __name__ == "__main__":
 
     # ── Build and attach real-video memory bank (optional) ──────────────────
     if args.use_memory_bank:
-        bank = build_memory_bank(model, train_dataset, k=args.knn_k, num_workers=_num_workers)
-        model.attach_memory_bank(bank)
+        print("Memory bank will be rebuilt from temporal layer 1 at the start of every epoch.")
 
     if not args.no_compile and hasattr(torch, "compile"):
         print("Compiling model with torch.compile …")
@@ -741,6 +753,11 @@ if __name__ == "__main__":
         print(f"\n{SEP}")
         print(f"  EPOCH {epoch+1}/{epochs}")
         print(SEP)
+
+        if args.use_memory_bank:
+            bank = build_memory_bank(model, train_dataset, k=args.knn_k, num_workers=_num_workers)
+            raw_for_bank = model._orig_mod if hasattr(model, "_orig_mod") else model
+            raw_for_bank.attach_memory_bank(bank)
 
         model.train()
         # Enforce eval mode on the frozen backbone so Dropout / BN use

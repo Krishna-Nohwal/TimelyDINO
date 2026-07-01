@@ -289,7 +289,40 @@ class TemporalTransformer(nn.Module):
         nn.init.trunc_normal_(self.pos_embed,   std=0.02)
         nn.init.trunc_normal_(self.video_token, std=0.02)
 
+    def first_layer(
+        self,
+        frame_cls: Tensor,
+        key_padding_mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        B, T, _ = frame_cls.shape
+        if T > self.num_frames:
+            raise ValueError(f"Expected <= {self.num_frames} frames, got {T}")
+
+        x           = frame_cls + self.pos_embed[:, :T, :]
+        video_token = self.video_token.expand(B, -1, -1)
+        x           = torch.cat([video_token, x], dim=1)
+
+        if key_padding_mask is not None:
+            video_mask       = torch.zeros(B, 1, dtype=torch.bool, device=key_padding_mask.device)
+            key_padding_mask = torch.cat([video_mask, key_padding_mask], dim=1)
+
+        x = self.encoder.layers[0](x, src_key_padding_mask=key_padding_mask)
+        return x, key_padding_mask
+
+    def finish_from_first(
+        self,
+        x: Tensor,
+        full_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        for layer in self.encoder.layers[1:]:
+            x = layer(x, src_key_padding_mask=full_padding_mask)
+        x = self.norm(x)
+        return x[:, 0]
+
     def forward(self, frame_cls: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        x, full_padding_mask = self.first_layer(frame_cls, key_padding_mask)
+        return self.finish_from_first(x, full_padding_mask)
+
         B, T, _ = frame_cls.shape
         if T > self.num_frames:
             raise ValueError(f"Expected ≤{self.num_frames} frames, got {T}")
@@ -393,6 +426,40 @@ class VideoViT(nn.Module):
         )
         self.memory_bank = bank
 
+    def memory_features_for_bank(
+        self,
+        video: Tensor,
+        lengths: Optional[Tensor] = None,
+    ) -> tuple[List[Tensor], Optional[Tensor]]:
+        """
+        Return per-head frame-token sequences after temporal layer 1.
+
+        Used to rebuild the real-video memory bank at the start of each epoch.
+        """
+        B, T, C, H, W = video.shape
+        if T > self.num_frames:
+            raise ValueError(f"Expected <= {self.num_frames} frames, got {T}")
+
+        frames = video.reshape(B * T, C, H, W)
+        _, _, cls_list = self.frame_model(frames)
+
+        if lengths is None:
+            key_padding_mask = None
+        else:
+            time_idx = torch.arange(T, device=video.device).unsqueeze(0)
+            key_padding_mask = time_idx >= lengths.to(video.device).unsqueeze(1)
+
+        cls_sequences = [
+            cls_tokens.reshape(B, T, self.EMBED_DIM) for cls_tokens in cls_list
+        ]
+
+        memory_sequences = []
+        for temporal_tfm, frame_cls in zip(self.temporal_transformers, cls_sequences):
+            x, _ = temporal_tfm.first_layer(frame_cls, key_padding_mask)
+            memory_sequences.append(x[:, 1:, :])
+
+        return memory_sequences, key_padding_mask
+
     # ── Forward ─────────────────────────────────────────────────────────────
 
     def forward(self, video: Tensor, lengths: Optional[Tensor] = None):
@@ -432,6 +499,42 @@ class VideoViT(nn.Module):
         cls_sequences = [
             cls_tokens.reshape(B, T, self.EMBED_DIM) for cls_tokens in cls_list
         ]
+
+        first_outputs = []
+        full_masks = []
+        memory_query_sequences = []
+        for temporal_tfm, frame_cls in zip(self.temporal_transformers, cls_sequences):
+            if self.training:
+                frame_cls = temporal_augment(frame_cls, key_padding_mask)
+            x, full_padding_mask = temporal_tfm.first_layer(frame_cls, key_padding_mask)
+            first_outputs.append(x)
+            full_masks.append(full_padding_mask)
+            memory_query_sequences.append(x[:, 1:, :])
+
+        if self.use_memory_bank:
+            assert self.memory_bank is not None, (
+                "use_memory_bank=True but no bank attached. "
+                "Call attach_memory_bank() first."
+            )
+            memory_refs = self.memory_bank.query(memory_query_sequences, key_padding_mask)
+        else:
+            memory_refs = None
+
+        video_feats_list = []
+        for h, (temporal_tfm, x, full_padding_mask) in enumerate(
+            zip(self.temporal_transformers, first_outputs, full_masks)
+        ):
+            if memory_refs is not None:
+                gate = torch.sigmoid(self.memory_gate[h]).to(dtype=x.dtype)
+                memory_ref = memory_refs[h].unsqueeze(1)
+                frame_tokens = (1 - gate) * x[:, 1:, :] + gate * memory_ref
+                x = torch.cat([x[:, :1, :], frame_tokens], dim=1)
+            video_feats_list.append(temporal_tfm.finish_from_first(x, full_padding_mask))
+
+        temporal_vec = torch.cat(video_feats_list, dim=1)
+        video_logits = self.fusion_classifier(temporal_vec)
+
+        return video_logits, frame_logits_list, frame_feats_list, video_feats_list
 
         if self.use_memory_bank:
             assert self.memory_bank is not None, (
