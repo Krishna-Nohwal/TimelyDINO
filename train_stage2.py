@@ -810,7 +810,7 @@ if __name__ == "__main__":
             gate_real_avg = gate_real_sum / max(gate_real_count, 1)
             gate_fake_avg = gate_fake_sum / max(gate_fake_count, 1)
             print(
-                f"  Memory gate mean: avg={gate_avg:.4f}  "
+                f"  Memory gate: avg={gate_avg:.4f}  "
                 f"real_avg={gate_real_avg:.4f}  fake_avg={gate_fake_avg:.4f}"
             )
         compute_metrics(train_frame_labels,   train_frame_probs,     "Train (A) frame    ", epoch)
