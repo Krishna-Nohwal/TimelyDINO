@@ -445,7 +445,7 @@ def run_last_layer_models(args, image_tensor: torch.Tensor, base_image: Image.Im
             f"{name} | Grad-CAM block 22 -> fake logit",
         )
 
-        with torch.inference_mode():
+        with torch.no_grad():
             prefix_tokens, patch_tokens, height, width = patch_tokens_from_model(model, image_tensor)
 
         if name == "cls":
@@ -460,7 +460,7 @@ def run_last_layer_models(args, image_tensor: torch.Tensor, base_image: Image.Im
             grid = np.ones((height, width), dtype=np.float32)
             save_heatmap(base_image, grid, out_dir / "uniform_avg_pooling.png", "Patch average pooling weights")
         else:
-            attn = model.patch_pool.attention(patch_tokens)
+            attn = model.patch_pool.attention(patch_tokens.detach().clone())
             save_pool_attention_maps(base_image, attn, height, width, out_dir, name)
 
         del model
@@ -481,7 +481,7 @@ def run_four_layer_model(args, image_tensor: torch.Tensor, base_image: Image.Ima
         "vit_4layers | Grad-CAM block 22 -> layer 23 fake logit",
     )
 
-    with torch.inference_mode():
+    with torch.no_grad():
         _, intermediates = model.vit.forward_intermediates(
             image_tensor,
             indices=model.LAYERS,
@@ -494,7 +494,7 @@ def run_four_layer_model(args, image_tensor: torch.Tensor, base_image: Image.Ima
             patch_tokens = spatial_map.permute(0, 2, 3, 1).contiguous().reshape(
                 bsz, height * width, channels
             )
-            attn = model.spatial_heads[layer_idx].patch_pool.attention(patch_tokens)
+            attn = model.spatial_heads[layer_idx].patch_pool.attention(patch_tokens.detach().clone())
             layer_name = f"layer{model.LAYERS[layer_idx]}"
             save_pool_attention_maps(base_image, attn, height, width, out_dir, layer_name)
 
