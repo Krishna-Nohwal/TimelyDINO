@@ -60,27 +60,77 @@ def parse_args():
     return parser.parse_args()
 
 
-def discover_real_images(root: str) -> list[str]:
-    root_path = Path(root)
+def _safe_walk(root: str):
+    """
+    Yield files under root without crashing on dead directories, broken mount
+    entries, permission errors, or folders that disappear during traversal.
+    """
+    root_path = Path(root).expanduser()
     if not root_path.exists():
         raise FileNotFoundError(f"Root does not exist: {root_path}")
 
+    skipped_dirs = []
+
+    def onerror(exc):
+        skipped_dirs.append((getattr(exc, "filename", ""), repr(exc)))
+
+    for dirpath, dirnames, filenames in os.walk(root_path, topdown=True, onerror=onerror, followlinks=False):
+        # Avoid descending into symlinked dirs; they are common sources of loops
+        # and dead entries on mounted/generated datasets.
+        kept_dirs = []
+        for dirname in dirnames:
+            child = Path(dirpath) / dirname
+            try:
+                if child.is_symlink():
+                    skipped_dirs.append((str(child), "symlink directory skipped"))
+                    continue
+            except OSError as exc:
+                skipped_dirs.append((str(child), repr(exc)))
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+
+        for filename in filenames:
+            path = Path(dirpath) / filename
+            try:
+                if path.is_file():
+                    yield path, skipped_dirs
+            except OSError as exc:
+                skipped_dirs.append((str(path), repr(exc)))
+
+    if skipped_dirs:
+        yield None, skipped_dirs
+
+
+def _print_skipped_scan_items(name: str, skipped: list[tuple[str, str]], max_print: int = 10):
+    if not skipped:
+        return
+    print(f"  [{name}] skipped inaccessible/dead entries: {len(skipped)}")
+    for path, reason in skipped[:max_print]:
+        print(f"    skip: {path}  ({reason})")
+    if len(skipped) > max_print:
+        print(f"    ... {len(skipped) - max_print} more skipped")
+
+
+def discover_real_images(root: str) -> list[str]:
     paths = []
-    for path in root_path.rglob("*"):
-        if path.is_file() and path.name == "image.png":
+    skipped = []
+    for path, skipped_dirs in _safe_walk(root):
+        skipped = skipped_dirs
+        if path is not None and path.name == "image.png":
             paths.append(str(path))
+    _print_skipped_scan_items("REAL scan", skipped)
     return sorted(paths)
 
 
 def discover_fake_images(root: str) -> list[str]:
-    root_path = Path(root)
-    if not root_path.exists():
-        raise FileNotFoundError(f"Root does not exist: {root_path}")
-
     paths = []
-    for path in root_path.rglob("*"):
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTS:
+    skipped = []
+    for path, skipped_dirs in _safe_walk(root):
+        skipped = skipped_dirs
+        if path is not None and path.suffix.lower() in IMAGE_EXTS:
             paths.append(str(path))
+    _print_skipped_scan_items("FAKE scan", skipped)
     return sorted(paths)
 
 
