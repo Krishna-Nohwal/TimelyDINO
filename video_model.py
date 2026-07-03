@@ -230,7 +230,7 @@ def temporal_augment(
             tokens = out[b, valid]
             norms  = tokens.norm(dim=-1, keepdim=True)
             noise  = torch.randn_like(tokens) * noise_std * norms
-            out[b, valid] = tokens + noise
+            out[b, valid] = (tokens + noise).to(dtype=out.dtype)
 
         if torch.rand(1).item() < mixup_prob and n_valid >= 2:
             perm   = torch.randperm(n_valid, device=frame_cls.device)
