@@ -342,6 +342,25 @@ def save_pool_attention_maps(
     save_heatmap(base_image, mean_grid, out_dir / f"{prefix}_mean.png", f"{prefix} | attention mean")
 
 
+def attention_from_pool(pool: nn.Module, patch_tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Return AttentionPool weights for both the local AttentionPool class and the
+    AttentionPool class imported through frame_model.py.
+    """
+    patch_tokens = patch_tokens.detach().clone()
+    if hasattr(pool, "attention"):
+        return pool.attention(patch_tokens)
+
+    bsz, num_tokens, channels = patch_tokens.shape
+    num_heads = pool.num_heads
+    head_dim = pool.head_dim
+    x_heads = patch_tokens.view(bsz, num_tokens, num_heads, head_dim).permute(0, 2, 1, 3)
+    q = pool.query.expand(bsz, -1, -1, -1)
+    attn = (q @ x_heads.transpose(-2, -1)) * pool.scale
+    attn = attn + pool._positional_bias(num_tokens, patch_tokens.device, attn.dtype)
+    return attn.softmax(dim=-1).squeeze(2)
+
+
 def get_backbone_blocks(model: nn.Module):
     vit = getattr(model, "vit", None)
     if vit is None:
@@ -460,7 +479,7 @@ def run_last_layer_models(args, image_tensor: torch.Tensor, base_image: Image.Im
             grid = np.ones((height, width), dtype=np.float32)
             save_heatmap(base_image, grid, out_dir / "uniform_avg_pooling.png", "Patch average pooling weights")
         else:
-            attn = model.patch_pool.attention(patch_tokens.detach().clone())
+            attn = attention_from_pool(model.patch_pool, patch_tokens)
             save_pool_attention_maps(base_image, attn, height, width, out_dir, name)
 
         del model
@@ -494,7 +513,7 @@ def run_four_layer_model(args, image_tensor: torch.Tensor, base_image: Image.Ima
             patch_tokens = spatial_map.permute(0, 2, 3, 1).contiguous().reshape(
                 bsz, height * width, channels
             )
-            attn = model.spatial_heads[layer_idx].patch_pool.attention(patch_tokens.detach().clone())
+            attn = attention_from_pool(model.spatial_heads[layer_idx].patch_pool, patch_tokens)
             layer_name = f"layer{model.LAYERS[layer_idx]}"
             save_pool_attention_maps(base_image, attn, height, width, out_dir, layer_name)
 
