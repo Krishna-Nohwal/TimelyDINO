@@ -1,5 +1,5 @@
 """
-Visualize last-layer token maps for checkpoints_vit_4layers.
+Visualize MAC-style last-layer attention maps for checkpoints_vit_4layers.
 
 Model:
   frame_model.py::ViT loaded from checkpoints_vit_4layers/best.pth
@@ -8,16 +8,18 @@ Input:
   one user-provided image, resized to 256x256.
 
 Outputs for the last tapped layer only, i.e. DINOv3 block 23:
-  - CLS: cosine-similarity map between CLS token and patch tokens
-  - REG: cosine-similarity map between mean register token and patch tokens
-  - Patch: uniform patch-average pooling map
+  - CLS: final-block self-attention from CLS query to patch keys
+  - REG: final-block self-attention from REG queries to patch keys
+  - Patch/AVG: final-block self-attention from patch queries to patch keys
   - Patch*: learned patch attention-pooling map from SpatialHead.patch_pool
 
-Patch* means the attention-pooled patch branch. Patch means average pooling.
+CLS, REG, and Patch/AVG follow the DINO-MAC visualization style: maps are
+averaged across ViT attention heads and, for REG/Patch, across tokens in the
+group. Patch* is shown separately because it is our SpatialHead's learned
+patch-pooling attention.
 """
 
 import argparse
-import os
 from pathlib import Path
 
 import numpy as np
@@ -80,7 +82,7 @@ def jet_colormap(values: np.ndarray) -> np.ndarray:
     return np.stack([r, g, b], axis=-1)
 
 
-def save_heatmap(base_image: Image.Image, grid: np.ndarray, out_path: Path, title: str, alpha: float):
+def make_panel(base_image: Image.Image, grid: np.ndarray, title: str, alpha: float) -> Image.Image:
     grid = normalize_map(grid)
     heat = jet_colormap(grid)
     heat_img = Image.fromarray((heat * 255).astype(np.uint8)).resize(base_image.size, Image.BICUBIC)
@@ -94,17 +96,44 @@ def save_heatmap(base_image: Image.Image, grid: np.ndarray, out_path: Path, titl
     except OSError:
         font = ImageFont.load_default()
     draw.text((8, 7), title, fill=(0, 0, 0), font=font)
+    return canvas
 
+
+def save_heatmap(base_image: Image.Image, grid: np.ndarray, out_path: Path, title: str, alpha: float):
+    canvas = make_panel(base_image, grid, title, alpha)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)
     print(f"Saved {out_path}")
 
 
-def cosine_grid(query: torch.Tensor, patches: torch.Tensor, height: int, width: int) -> np.ndarray:
-    query = torch.nn.functional.normalize(query.float(), dim=-1)
-    patches = torch.nn.functional.normalize(patches.float(), dim=-1)
-    scores = (patches * query.unsqueeze(1)).sum(dim=-1)
-    return scores[0].detach().cpu().numpy().reshape(height, width)
+def make_input_panel(base_image: Image.Image, title: str = "Input") -> Image.Image:
+    canvas = Image.new("RGB", (base_image.width, base_image.height + 30), "white")
+    canvas.paste(base_image.convert("RGB"), (0, 30))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except OSError:
+        font = ImageFont.load_default()
+    draw.text((8, 7), title, fill=(0, 0, 0), font=font)
+    return canvas
+
+
+def save_contact_sheet(base_image: Image.Image, maps: dict, out_path: Path, alpha: float):
+    panels = [
+        make_input_panel(base_image, "Input"),
+        make_panel(base_image, maps["cls"], "CLS", alpha),
+        make_panel(base_image, maps["reg"], "REG", alpha),
+        make_panel(base_image, maps["patch"], "Patch/AVG", alpha),
+        make_panel(base_image, maps["patch_star"], "Patch*", alpha),
+    ]
+    sheet = Image.new("RGB", (sum(p.width for p in panels), panels[0].height), "white")
+    x = 0
+    for panel in panels:
+        sheet.paste(panel, (x, 0))
+        x += panel.width
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out_path)
+    print(f"Saved {out_path}")
 
 
 def patch_attention_from_pool(pool, patch_tokens: torch.Tensor) -> torch.Tensor:
@@ -119,17 +148,85 @@ def patch_attention_from_pool(pool, patch_tokens: torch.Tensor) -> torch.Tensor:
     return attn.softmax(dim=-1).squeeze(2)  # (B, pool_heads, N)
 
 
+def get_blocks(vit_module):
+    candidates = [vit_module]
+    for attr in ("base_model", "model"):
+        obj = getattr(candidates[-1], attr, None)
+        if obj is not None:
+            candidates.append(obj)
+    base_model = getattr(vit_module, "base_model", None)
+    if base_model is not None and getattr(base_model, "model", None) is not None:
+        candidates.append(base_model.model)
+
+    for obj in candidates:
+        blocks = getattr(obj, "blocks", None)
+        if blocks is not None:
+            return blocks
+    raise AttributeError("Could not find ViT blocks on model.vit or its PEFT-wrapped base model.")
+
+
+def compute_attention_matrix(attn_module, attn_input: torch.Tensor) -> torch.Tensor:
+    bsz, num_tokens, _ = attn_input.shape
+    qkv = attn_module.qkv(attn_input)
+    qkv = qkv.reshape(
+        bsz,
+        num_tokens,
+        3,
+        attn_module.num_heads,
+        attn_module.head_dim,
+    ).permute(2, 0, 3, 1, 4)
+    q, k, _ = qkv.unbind(0)
+    q = attn_module.q_norm(q)
+    k = attn_module.k_norm(k)
+    attn = (q.float() * attn_module.scale) @ k.float().transpose(-2, -1)
+    return attn.softmax(dim=-1)
+
+
+def self_attention_grids(attn: torch.Tensor, num_reg: int, height: int, width: int) -> dict:
+    patch_start = 1 + num_reg
+    patch_end = patch_start + height * width
+    if attn.shape[-1] < patch_end:
+        raise ValueError(
+            f"Attention has {attn.shape[-1]} tokens, but expected at least {patch_end} "
+            f"for CLS + {num_reg} REG + {height * width} patches."
+        )
+
+    patch_cols = slice(patch_start, patch_end)
+    cls_map = attn[0, :, 0, patch_cols].mean(dim=0)
+    reg_map = attn[0, :, 1:patch_start, patch_cols].mean(dim=(0, 1))
+    patch_map = attn[0, :, patch_start:patch_end, patch_cols].mean(dim=(0, 1))
+
+    return {
+        "cls": cls_map.detach().cpu().numpy().reshape(height, width),
+        "reg": reg_map.detach().cpu().numpy().reshape(height, width),
+        "patch": patch_map.detach().cpu().numpy().reshape(height, width),
+    }
+
+
 @torch.no_grad()
 def compute_last_layer_maps(model: ViT, image_tensor: torch.Tensor):
     last_layer = model.LAYERS[-1]
     spatial_head = model.spatial_heads[-1]
+    blocks = get_blocks(model.vit)
+    final_block = blocks[last_layer]
+    captured = {}
 
-    _, intermediates = model.vit.forward_intermediates(
-        image_tensor,
-        indices=[last_layer],
-        return_prefix_tokens=True,
-        norm=True,
-    )
+    def capture_attn_input(_module, inputs):
+        captured["attn_input"] = inputs[0].detach().clone()
+
+    handle = final_block.attn.register_forward_pre_hook(capture_attn_input)
+    try:
+        _, intermediates = model.vit.forward_intermediates(
+            image_tensor,
+            indices=[last_layer],
+            return_prefix_tokens=True,
+            norm=True,
+        )
+    finally:
+        handle.remove()
+
+    if "attn_input" not in captured:
+        raise RuntimeError("Could not capture the final-block attention input.")
 
     spatial_map, prefix_tokens = intermediates[0]
     bsz, channels, height, width = spatial_map.shape
@@ -139,12 +236,9 @@ def compute_last_layer_maps(model: ViT, image_tensor: torch.Tensor):
 
     cls_tok_full = prefix_tokens[:, :1, :]
     reg_tok_full = prefix_tokens[:, 1:1 + model.NUM_REG, :]
-    cls_tok = cls_tok_full.squeeze(1)
-    reg_tok = reg_tok_full.mean(dim=1)
 
-    cls_map = cosine_grid(cls_tok, patch_tokens, height, width)
-    reg_map = cosine_grid(reg_tok, patch_tokens, height, width)
-    patch_avg_map = np.ones((height, width), dtype=np.float32)
+    final_attn = compute_attention_matrix(final_block.attn, captured["attn_input"])
+    maps = self_attention_grids(final_attn, model.NUM_REG, height, width)
 
     patch_star_attn = patch_attention_from_pool(spatial_head.patch_pool, patch_tokens)
     patch_star_map = patch_star_attn[0].mean(dim=0).detach().cpu().numpy().reshape(height, width)
@@ -153,9 +247,9 @@ def compute_last_layer_maps(model: ViT, image_tensor: torch.Tensor):
     probs = torch.softmax(result["logits"], dim=1)[0].detach().cpu().numpy()
 
     return {
-        "cls": cls_map,
-        "reg": reg_map,
-        "patch": patch_avg_map,
+        "cls": maps["cls"],
+        "reg": maps["reg"],
+        "patch": maps["patch"],
         "patch_star": patch_star_map,
         "probs": probs,
     }
@@ -192,10 +286,11 @@ def main():
     print(f"  real probability: {real_prob:.4f}")
     print(f"  fake probability: {fake_prob:.4f}")
 
-    save_heatmap(base_image, maps["cls"], out_dir / "01_cls_heatmap.png", "CLS | layer 23", args.alpha)
-    save_heatmap(base_image, maps["reg"], out_dir / "02_reg_heatmap.png", "REG | layer 23", args.alpha)
-    save_heatmap(base_image, maps["patch"], out_dir / "03_patch_avg_heatmap.png", "Patch avg | layer 23", args.alpha)
-    save_heatmap(base_image, maps["patch_star"], out_dir / "04_patch_star_attention_heatmap.png", "Patch* attention | layer 23", args.alpha)
+    save_heatmap(base_image, maps["cls"], out_dir / "01_cls_self_attention.png", "CLS | final block attention", args.alpha)
+    save_heatmap(base_image, maps["reg"], out_dir / "02_reg_self_attention.png", "REG | final block attention", args.alpha)
+    save_heatmap(base_image, maps["patch"], out_dir / "03_patch_avg_self_attention.png", "Patch/AVG | final block attention", args.alpha)
+    save_heatmap(base_image, maps["patch_star"], out_dir / "04_patch_star_pooling_attention.png", "Patch* | pooling attention", args.alpha)
+    save_contact_sheet(base_image, maps, out_dir / "00_mac_style_contact_sheet.png", args.alpha)
 
     print(f"\nDone. Outputs saved to: {out_dir.resolve()}")
 
