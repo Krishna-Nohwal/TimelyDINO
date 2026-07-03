@@ -1,7 +1,7 @@
 """
-Grid-search memory gate initialization for train_stage2_frame_end.py.
+Grid-search memory gate initialization for the patch* Stage-2 frame-end script.
 
-Each trial runs train_stage2_frame_end.py with memory enabled. The child
+Each trial runs train_stage2_frame_end_patch_attn.py with memory enabled. The child
 process writes directly to the terminal, so tqdm progress bars stay normal
 instead of being reprinted through a pipe.
 
@@ -15,8 +15,7 @@ Example
 python grid_search_stage2_frame_end.py ^
     --gate_inits 0.13,0.20,0.35,0.50 ^
     --epochs_per_trial 10 ^
-    -- --load_from checkpoints_vit_4layers/best.pth ^
-       --manifest E:/Work/sampled_30k/manifest_onct.csv ^
+    -- --manifest E:/Work/sampled_30k/manifest_onct.csv ^
        --root_dir E:/Work/sampled_30k/ ^
        --cdf_root E:/Work/cdfv1_onct_out ^
        --cdf_csv E:/Work/cdfv1_onct_out/manifest_cdfv1_onct.csv ^
@@ -37,6 +36,7 @@ CONTROLLED_OPTIONS_WITH_VALUES = {
     "--knn_k",
     "--metrics_csv",
     "--run_name",
+    "--load_from",
 }
 CONTROLLED_FLAGS = {"--use_memory_bank"}
 
@@ -77,6 +77,7 @@ def run_trial(
     epochs: int,
     save_root: Path,
     metrics_csv: Path,
+    stage1_checkpoint: Path,
     passthrough_args: list[str],
     dry_run: bool,
 ) -> int:
@@ -91,6 +92,7 @@ def run_trial(
         "--save_root", str(trial_save_root),
         "--metrics_csv", str(metrics_csv),
         "--run_name", run_name,
+        "--load_from", str(stage1_checkpoint),
         *passthrough_args,
     ]
 
@@ -186,11 +188,12 @@ def write_summary(metrics_csv: Path, summary_csv: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Grid search train_stage2_frame_end.py memory gate initialization."
+        description="Grid search patch* Stage-2 frame-end memory gate initialization."
     )
-    parser.add_argument("--train_script", default="train_stage2_frame_end.py", type=str)
+    parser.add_argument("--train_script", default="train_stage2_frame_end_patch_attn.py", type=str)
     parser.add_argument("--python", default=sys.executable, type=str)
     parser.add_argument("--save_root", default="checkpoints_s2_frame_end_grid", type=str)
+    parser.add_argument("--stage1_checkpoint", default="main_checkpoint/best.pth", type=str)
     parser.add_argument("--epochs_per_trial", default=10, type=int)
     parser.add_argument("--gate_inits", default="0.13,0.20,0.35,0.50", type=str)
     parser.add_argument("--knn_k", default=32, type=int)
@@ -205,6 +208,7 @@ def main():
     metrics_csv = save_root / "grid_metrics.csv"
     summary_csv = save_root / "grid_summary.csv"
     train_script = Path(args.train_script)
+    stage1_checkpoint = Path(args.stage1_checkpoint)
 
     failures = []
     for gate_init in parse_float_list(args.gate_inits):
@@ -218,6 +222,7 @@ def main():
             args.epochs_per_trial,
             save_root,
             metrics_csv,
+            stage1_checkpoint,
             passthrough,
             args.dry_run,
         )
