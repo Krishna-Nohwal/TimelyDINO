@@ -1,6 +1,6 @@
 """
-Save patch attention / patch-importance maps for one input image across
-the Stage-1 ablation checkpoints.
+Save patch attention / patch-importance maps for one or more input images
+across the Stage-1 ablation checkpoints.
 
 Actual learned attention maps are saved for:
   - checkpoints_patch_attn
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
+import pandas as pd
 import timm
 import torch
 from peft import LoraConfig, get_peft_model
@@ -40,6 +41,59 @@ def load_image(path: str, size: int = IMG_SIZE) -> Tuple[torch.Tensor, Image.Ima
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
     tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
     return tensor, image
+
+
+def resolve_sample_image(sample_dir: str, root_dir: str) -> str:
+    rel = str(sample_dir).replace("\\", "/")
+    root = Path(root_dir)
+    candidates = []
+
+    rel_path = Path(rel)
+    if rel_path.is_absolute():
+        candidates.append(rel_path if rel_path.name == "image.png" else rel_path / "image.png")
+
+    candidates.append(root / rel / "image.png")
+    if "sampled_30k/" in rel:
+        candidates.append(root / rel.split("sampled_30k/", 1)[1] / "image.png")
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return str(candidates[0])
+
+
+def sample_images_from_manifest(manifest: str, root_dir: str, num_images: int, seed: int) -> list[str]:
+    df = pd.read_csv(manifest)
+    if "sample_dir" not in df.columns:
+        raise ValueError(f"Manifest must contain sample_dir. Found: {list(df.columns)}")
+
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(df))
+    selected = []
+    missing = 0
+    for idx in order:
+        path = resolve_sample_image(df.iloc[int(idx)]["sample_dir"], root_dir)
+        if os.path.isfile(path):
+            selected.append(path)
+            if len(selected) >= num_images:
+                break
+        else:
+            missing += 1
+
+    if len(selected) < num_images:
+        raise RuntimeError(
+            f"Only found {len(selected)} valid images from {manifest}; "
+            f"missing checked entries={missing}."
+        )
+    return selected
+
+
+def safe_sample_name(path: str, idx: int) -> str:
+    p = Path(path)
+    parent = p.parent.name or "image"
+    grandparent = p.parent.parent.name or "sample"
+    name = f"{idx:03d}_{grandparent}_{parent}"
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
 
 
 def make_backbone(drop_path: float = 0.10):
@@ -349,7 +403,11 @@ def run_four_layer_model(args, image_tensor: torch.Tensor, base_image: Image.Ima
 
 def main():
     parser = argparse.ArgumentParser("Save attention maps for ablation checkpoints")
-    parser.add_argument("--image", required=True, type=str, help="Input image path.")
+    parser.add_argument("--image", default="", type=str, help="Optional single input image path.")
+    parser.add_argument("--manifest", default="E:/Work/sampled_30k/manifest_onct.csv", type=str)
+    parser.add_argument("--root_dir", default="E:/Work/sampled_30k/", type=str)
+    parser.add_argument("--num_images", default=4, type=int)
+    parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--out_dir", default="attention_maps", type=str)
     parser.add_argument("--cls_ckpt", default="checkpoints_cls/best.pth", type=str)
     parser.add_argument("--reg_ckpt", default="checkpoints_reg/best.pth", type=str)
@@ -361,16 +419,40 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    image_tensor, base_image = load_image(args.image)
-    image_tensor = image_tensor.to(device)
+    if args.image:
+        image_paths = [args.image]
+    else:
+        image_paths = sample_images_from_manifest(
+            args.manifest,
+            args.root_dir,
+            num_images=args.num_images,
+            seed=args.seed,
+        )
+        print(f"Sampled {len(image_paths)} images from {args.manifest}")
 
-    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-    base_image.save(Path(args.out_dir) / "input.png")
+    base_out_dir = Path(args.out_dir)
+    base_out_dir.mkdir(parents=True, exist_ok=True)
 
-    run_last_layer_models(args, image_tensor, base_image, device)
-    run_four_layer_model(args, image_tensor, base_image, device)
+    original_out_dir = args.out_dir
+    for idx, image_path in enumerate(image_paths):
+        sample_dir = base_out_dir / safe_sample_name(image_path, idx)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        args.out_dir = str(sample_dir)
 
-    print(f"\nSaved maps to: {Path(args.out_dir).resolve()}")
+        print("\n" + "=" * 88)
+        print(f"Image {idx + 1}/{len(image_paths)}: {image_path}")
+        print(f"Output: {sample_dir}")
+        print("=" * 88)
+
+        image_tensor, base_image = load_image(image_path)
+        image_tensor = image_tensor.to(device)
+        base_image.save(sample_dir / "input.png")
+
+        run_last_layer_models(args, image_tensor, base_image, device)
+        run_four_layer_model(args, image_tensor, base_image, device)
+
+    args.out_dir = original_out_dir
+    print(f"\nSaved maps to: {base_out_dir.resolve()}")
 
 
 if __name__ == "__main__":
