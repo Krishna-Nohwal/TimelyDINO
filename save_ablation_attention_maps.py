@@ -1,17 +1,16 @@
 """
-Save patch attention / patch-importance maps for one or more input images
-across the Stage-1 ablation checkpoints.
+Save patch attribution and attention-pooling visualizations for one or more
+input images across the Stage-1 ablation checkpoints.
+
+For every checkpoint, the script saves a shared Grad-CAM-style patch
+attribution map from the output of DINOv3 block 22 to the fake-class logit.
+This is comparable across CLS, REG, patch-average, patch-attention,
+last-layer-all, and 4-layer models.
 
 Actual learned attention maps are saved for:
   - checkpoints_patch_attn
   - checkpoints_last_layer_all
   - checkpoints_vit_4layers
-
-The CLS, REG, and patch-average checkpoints do not contain an attention-pooling
-module. For those, this script saves clearly named comparison maps:
-  - CLS: cosine similarity between the CLS token and each patch token
-  - REG: cosine similarity between mean register token and each patch token
-  - Patch average: uniform pooling weights
 """
 
 import argparse
@@ -343,7 +342,78 @@ def save_pool_attention_maps(
     save_heatmap(base_image, mean_grid, out_dir / f"{prefix}_mean.png", f"{prefix} | attention mean")
 
 
-@torch.inference_mode()
+def get_backbone_blocks(model: nn.Module):
+    vit = getattr(model, "vit", None)
+    if vit is None:
+        raise AttributeError("Model has no .vit backbone")
+    if hasattr(vit, "base_model") and hasattr(vit.base_model, "model"):
+        return vit.base_model.model.blocks
+    return vit.blocks
+
+
+def infer_square_grid(num_tokens: int) -> tuple[int, int]:
+    side = int(round(num_tokens ** 0.5))
+    if side * side != num_tokens:
+        raise ValueError(f"Cannot infer square patch grid from {num_tokens} tokens")
+    return side, side
+
+
+def gradcam_patch_attribution(
+    model: nn.Module,
+    image_tensor: torch.Tensor,
+    model_kind: str,
+    block_idx: int = 22,
+    num_prefix_tokens: int = 5,
+) -> np.ndarray:
+    """
+    Grad-CAM-style attribution over patch tokens at the output of block_idx.
+
+    block 22 is used by default because its output feeds the final DINOv3 block,
+    making the attribution meaningful even for CLS-only and REG-only heads.
+    """
+    activation = {}
+
+    def hook(_module, _inputs, output):
+        out = output[0] if isinstance(output, tuple) else output
+        activation["value"] = out
+        out.retain_grad()
+
+    blocks = get_backbone_blocks(model)
+    handle = blocks[block_idx].register_forward_hook(hook)
+
+    try:
+        model.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            if model_kind == "vit4":
+                logits_list, _, _ = model(image_tensor)
+                logits = logits_list[3]
+            else:
+                output = model(image_tensor)
+                logits = output[0] if isinstance(output, tuple) else output
+
+            fake_score = logits[:, 1].sum()
+            fake_score.backward()
+
+        act = activation["value"]
+        grad = act.grad
+        if grad is None:
+            raise RuntimeError("No gradient captured for block attribution")
+
+        patch_act = act[:, num_prefix_tokens:, :].detach().float()
+        patch_grad = grad[:, num_prefix_tokens:, :].detach().float()
+
+        weights = patch_grad.mean(dim=1, keepdim=True)
+        cam = (patch_act * weights).sum(dim=-1).clamp(min=0)
+        if float(cam.max()) <= 1e-8:
+            cam = (patch_act * patch_grad).sum(dim=-1).abs()
+
+        height, width = infer_square_grid(cam.shape[1])
+        return cam[0].cpu().numpy().reshape(height, width)
+    finally:
+        handle.remove()
+        model.zero_grad(set_to_none=True)
+
+
 def run_last_layer_models(args, image_tensor: torch.Tensor, base_image: Image.Image, device: torch.device):
     configs: Dict[str, Tuple[nn.Module, str]] = {
         "cls": (CLSViT(), args.cls_ckpt),
@@ -356,9 +426,19 @@ def run_last_layer_models(args, image_tensor: torch.Tensor, base_image: Image.Im
     for name, (model, ckpt) in configs.items():
         print(f"\n{name}")
         model = load_checkpoint(model, ckpt, device)
-        prefix_tokens, patch_tokens, height, width = patch_tokens_from_model(model, image_tensor)
-
         out_dir = Path(args.out_dir) / name
+
+        grad_grid = gradcam_patch_attribution(model, image_tensor, model_kind="last_layer")
+        save_heatmap(
+            base_image,
+            grad_grid,
+            out_dir / "gradcam_block22_to_fake_logit.png",
+            f"{name} | Grad-CAM block 22 -> fake logit",
+        )
+
+        with torch.inference_mode():
+            prefix_tokens, patch_tokens, height, width = patch_tokens_from_model(model, image_tensor)
+
         if name == "cls":
             cls_feat = prefix_tokens[:, 0, :]
             grid = cosine_grid(cls_feat, patch_tokens, height, width)
@@ -379,33 +459,42 @@ def run_last_layer_models(args, image_tensor: torch.Tensor, base_image: Image.Im
             torch.cuda.empty_cache()
 
 
-@torch.inference_mode()
 def run_four_layer_model(args, image_tensor: torch.Tensor, base_image: Image.Image, device: torch.device):
     print("\nvit_4layers")
     model = load_checkpoint(FourLayerViT(), args.vit4_ckpt, device)
-    _, intermediates = model.vit.forward_intermediates(
-        image_tensor,
-        indices=model.LAYERS,
-        return_prefix_tokens=True,
-        norm=True,
-    )
 
     out_dir = Path(args.out_dir) / "vit_4layers"
-    for layer_idx, (spatial_map, _) in enumerate(intermediates):
-        bsz, channels, height, width = spatial_map.shape
-        patch_tokens = spatial_map.permute(0, 2, 3, 1).contiguous().reshape(
-            bsz, height * width, channels
+    grad_grid = gradcam_patch_attribution(model, image_tensor, model_kind="vit4")
+    save_heatmap(
+        base_image,
+        grad_grid,
+        out_dir / "gradcam_block22_to_deepest_fake_logit.png",
+        "vit_4layers | Grad-CAM block 22 -> layer 23 fake logit",
+    )
+
+    with torch.inference_mode():
+        _, intermediates = model.vit.forward_intermediates(
+            image_tensor,
+            indices=model.LAYERS,
+            return_prefix_tokens=True,
+            norm=True,
         )
-        attn = model.spatial_heads[layer_idx].patch_pool.attention(patch_tokens)
-        layer_name = f"layer{model.LAYERS[layer_idx]}"
-        save_pool_attention_maps(base_image, attn, height, width, out_dir, layer_name)
+
+        for layer_idx, (spatial_map, _) in enumerate(intermediates):
+            bsz, channels, height, width = spatial_map.shape
+            patch_tokens = spatial_map.permute(0, 2, 3, 1).contiguous().reshape(
+                bsz, height * width, channels
+            )
+            attn = model.spatial_heads[layer_idx].patch_pool.attention(patch_tokens)
+            layer_name = f"layer{model.LAYERS[layer_idx]}"
+            save_pool_attention_maps(base_image, attn, height, width, out_dir, layer_name)
 
 
 def main():
     parser = argparse.ArgumentParser("Save attention maps for ablation checkpoints")
     parser.add_argument("--image", default="", type=str, help="Optional single input image path.")
-    parser.add_argument("--manifest", default="E:/Work/sampled_30k/manifest_onct.csv", type=str)
-    parser.add_argument("--root_dir", default="E:/Work/sampled_30k/", type=str)
+    parser.add_argument("--manifest", default="/raid/krishna/ffpp/preprocessed_out/manifest_ff_full.csv", type=str)
+    parser.add_argument("--root_dir", default="/raid/krishna/ffpp/preprocessed_out", type=str)
     parser.add_argument("--num_images", default=4, type=int)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--out_dir", default="attention_maps", type=str)
