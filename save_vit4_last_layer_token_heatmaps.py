@@ -137,8 +137,10 @@ def compute_last_layer_maps(model: ViT, image_tensor: torch.Tensor):
         bsz, height * width, channels
     )
 
-    cls_tok = prefix_tokens[:, 0, :]
-    reg_tok = prefix_tokens[:, 1:1 + model.NUM_REG, :].mean(dim=1)
+    cls_tok_full = prefix_tokens[:, :1, :]
+    reg_tok_full = prefix_tokens[:, 1:1 + model.NUM_REG, :]
+    cls_tok = cls_tok_full.squeeze(1)
+    reg_tok = reg_tok_full.mean(dim=1)
 
     cls_map = cosine_grid(cls_tok, patch_tokens, height, width)
     reg_map = cosine_grid(reg_tok, patch_tokens, height, width)
@@ -147,11 +149,15 @@ def compute_last_layer_maps(model: ViT, image_tensor: torch.Tensor):
     patch_star_attn = patch_attention_from_pool(spatial_head.patch_pool, patch_tokens)
     patch_star_map = patch_star_attn[0].mean(dim=0).detach().cpu().numpy().reshape(height, width)
 
+    result = spatial_head(cls_tok_full, reg_tok_full, patch_tokens)
+    probs = torch.softmax(result["logits"], dim=1)[0].detach().cpu().numpy()
+
     return {
         "cls": cls_map,
         "reg": reg_map,
         "patch": patch_avg_map,
         "patch_star": patch_star_map,
+        "probs": probs,
     }
 
 
@@ -177,6 +183,14 @@ def main():
 
     model = load_vit4(args.checkpoint, device)
     maps = compute_last_layer_maps(model, image_tensor)
+
+    real_prob = float(maps["probs"][0])
+    fake_prob = float(maps["probs"][1])
+    pred_label = "fake" if fake_prob >= real_prob else "real"
+    pred_prob = max(real_prob, fake_prob)
+    print(f"\nPrediction from last-layer head: {pred_label} ({pred_prob:.4f})")
+    print(f"  real probability: {real_prob:.4f}")
+    print(f"  fake probability: {fake_prob:.4f}")
 
     save_heatmap(base_image, maps["cls"], out_dir / "01_cls_heatmap.png", "CLS | layer 23", args.alpha)
     save_heatmap(base_image, maps["reg"], out_dir / "02_reg_heatmap.png", "REG | layer 23", args.alpha)
