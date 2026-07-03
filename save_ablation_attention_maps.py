@@ -375,8 +375,17 @@ def gradcam_patch_attribution(
 
     def hook(_module, _inputs, output):
         out = output[0] if isinstance(output, tuple) else output
-        activation["value"] = out
-        out.retain_grad()
+        # Some backbones can surface inference tensors here when surrounding
+        # evaluation code uses inference-mode paths. Clone before returning so
+        # downstream autograd saves a normal tensor for backward.
+        out_clone = out.clone()
+        if not out_clone.requires_grad:
+            out_clone.requires_grad_(True)
+        activation["value"] = out_clone
+        out_clone.retain_grad()
+        if isinstance(output, tuple):
+            return (out_clone, *output[1:])
+        return out_clone
 
     blocks = get_backbone_blocks(model)
     handle = blocks[block_idx].register_forward_hook(hook)
