@@ -1,24 +1,24 @@
 """
 Visualize temporal frame importance from a Stage-2 frame-end checkpoint.
 
-The script samples 8 frames uniformly from a user-provided video, runs the
-Stage-2 model, and visualizes the deepest temporal stream (DINO block 23):
+The script samples 8 frames uniformly from a user-provided folder of extracted
+frames, runs the Stage-2 model, and visualizes the deepest temporal stream
+(DINO block 23):
 
   1. frame-importance timeline from VID-token attention to frame tokens
   2. full temporal attention matrix over [VID, f1, ..., f8]
 
 Example:
     python save_temporal_frame_importance.py \
-        --video_path /path/to/video.mp4 \
+        --frame_folder /path/to/video_frames \
         --checkpoint checkpoints_s2_frame_end/best.pth \
         --output_dir temporal_viz
 """
 
 import argparse
 import csv
-import math
+import re
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -33,6 +33,7 @@ IMG_SIZE = 256
 NUM_VIS_FRAMES = 8
 STREAM_INDEX = 3
 STREAM_NAME = "layer23"
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
@@ -41,7 +42,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Save temporal frame-importance timeline and attention matrix."
     )
-    parser.add_argument("--video_path", required=True, type=str)
+    parser.add_argument("--frame_folder", "--folder", required=True, type=str)
     parser.add_argument("--checkpoint", default="checkpoints_s2_frame_end/best.pth", type=str)
     parser.add_argument(
         "--stage1_checkpoint",
@@ -167,66 +168,46 @@ def load_stage1_weights(model: FrameEndVideoViT, checkpoint: str):
     print(f"  frame missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
 
-def sample_video_frames(video_path: str, num_frames: int):
-    try:
-        import cv2
-    except ImportError as exc:
-        raise ImportError("This script needs OpenCV: pip install opencv-python") from exc
+def natural_key(path: Path):
+    parts = re.split(r"(\d+)", path.name.lower())
+    return [int(part) if part.isdigit() else part for part in parts]
 
-    path = Path(video_path).expanduser()
-    if not path.is_file():
-        raise FileNotFoundError(f"Video not found: {path}")
 
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {path}")
+def sample_frame_folder(frame_folder: str, num_frames: int):
+    folder = Path(frame_folder).expanduser()
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Frame folder not found: {folder}")
 
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    all_paths = sorted(
+        [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
+        key=natural_key,
+    )
+    if not all_paths:
+        raise RuntimeError(f"No image frames found in: {folder}")
+    if len(all_paths) < num_frames:
+        raise RuntimeError(
+            f"Need at least {num_frames} frames, but found only {len(all_paths)} in {folder}"
+        )
+
+    pick = np.linspace(0, len(all_paths) - 1, num_frames)
+    pick = np.round(pick).astype(int).tolist()
+    sampled_paths = [all_paths[i] for i in pick]
 
     frames = []
-    indices = []
-    if total > 0:
-        target_indices = np.linspace(0, max(total - 1, 0), num_frames)
-        target_indices = np.round(target_indices).astype(int).tolist()
-        for idx in target_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                frames = []
-                indices = []
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(frame).convert("RGB"))
-            indices.append(int(idx))
+    for path in sampled_paths:
+        try:
+            frames.append(Image.open(path).convert("RGB"))
+        except Exception as exc:
+            raise RuntimeError(f"Could not read sampled frame {path}: {exc}") from exc
 
-    if not frames:
-        cap.release()
-        cap = cv2.VideoCapture(str(path))
-        all_frames = []
-        read_idx = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            all_frames.append((read_idx, Image.fromarray(frame).convert("RGB")))
-            read_idx += 1
-        if not all_frames:
-            cap.release()
-            raise RuntimeError(f"No decodable frames found in: {path}")
-        pick = np.linspace(0, len(all_frames) - 1, num_frames)
-        pick = np.round(pick).astype(int).tolist()
-        indices = [all_frames[i][0] for i in pick]
-        frames = [all_frames[i][1] for i in pick]
-        total = len(all_frames)
+    print(f"Frame folder: {folder}")
+    print(f"  discovered image frames: {len(all_paths)}")
+    print(f"  sampled sorted positions: {pick}")
+    print("  sampled files:")
+    for slot, (pos, path) in enumerate(zip(pick, sampled_paths), start=1):
+        print(f"    f{slot}: pos={pos:03d}  file={path.name}")
 
-    cap.release()
-    print(f"Video: {path}")
-    print(f"  total frames reported/read: {total}")
-    print(f"  fps: {fps:.3f}" if fps > 0 else "  fps: unavailable")
-    print(f"  sampled indices: {indices}")
-    return frames, indices, total, fps
+    return frames, pick, sampled_paths
 
 
 def preprocess_frames(frames: list[Image.Image]) -> Tensor:
@@ -379,27 +360,42 @@ def get_font(size: int, bold: bool = False):
     return ImageFont.load_default()
 
 
-def save_sampled_frames(frames: list[Image.Image], indices: list[int], out_dir: Path):
+def safe_stem(path: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem)[:80]
+
+
+def save_sampled_frames(frames: list[Image.Image], indices: list[int], paths: list[Path], out_dir: Path):
     frame_dir = out_dir / "sampled_frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
-    for i, (image, idx) in enumerate(zip(frames, indices), start=1):
+    for i, (image, idx, path) in enumerate(zip(frames, indices, paths), start=1):
         image.resize((IMG_SIZE, IMG_SIZE), Image.BICUBIC).save(
-            frame_dir / f"frame_{i:02d}_src_{idx:06d}.png"
+            frame_dir / f"frame_{i:02d}_pos_{idx:03d}_{safe_stem(path)}.png"
         )
 
 
 def save_scores_csv(
     out_path: Path,
     indices: list[int],
+    paths: list[Path],
     raw_scores: np.ndarray,
     norm_scores: np.ndarray,
     frame_probs: np.ndarray,
 ):
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["slot", "source_frame_index", "vid_to_frame_attention", "normalized_score", "frame_fake_prob"])
-        for i, (idx, raw, norm, prob) in enumerate(zip(indices, raw_scores, norm_scores, frame_probs), start=1):
-            writer.writerow([i, idx, f"{raw:.8f}", f"{norm:.8f}", f"{prob:.8f}"])
+        writer.writerow([
+            "slot",
+            "sorted_position",
+            "filename",
+            "vid_to_frame_attention",
+            "normalized_score",
+            "frame_fake_prob",
+        ])
+        for i, (idx, path, raw, norm, prob) in enumerate(
+            zip(indices, paths, raw_scores, norm_scores, frame_probs),
+            start=1,
+        ):
+            writer.writerow([i, idx, path.name, f"{raw:.8f}", f"{norm:.8f}", f"{prob:.8f}"])
 
 
 def save_timeline(
@@ -521,8 +517,8 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    frames, indices, _, _ = sample_video_frames(args.video_path, args.num_frames)
-    save_sampled_frames(frames, indices, out_dir)
+    frames, indices, sampled_paths = sample_frame_folder(args.frame_folder, args.num_frames)
+    save_sampled_frames(frames, indices, sampled_paths, out_dir)
 
     model = load_model(args, device)
     video_tensor = preprocess_frames(frames).to(device)
@@ -537,10 +533,23 @@ def main():
     print(f"  p(real): {float(video_prob[0]):.6f}")
     print(f"  p(fake): {float(video_prob[1]):.6f}")
     print("\nFrame importance from VID -> frame attention")
-    for i, (idx, raw, norm, fp) in enumerate(zip(indices, importance_scores, norm_scores, frame_probs), start=1):
-        print(f"  f{i}: src_idx={idx:6d}  attn={raw:.6f}  norm={norm:.6f}  frame_p_fake={fp:.6f}")
+    for i, (idx, path, raw, norm, fp) in enumerate(
+        zip(indices, sampled_paths, importance_scores, norm_scores, frame_probs),
+        start=1,
+    ):
+        print(
+            f"  f{i}: pos={idx:03d}  file={path.name}  "
+            f"attn={raw:.6f}  norm={norm:.6f}  frame_p_fake={fp:.6f}"
+        )
 
-    save_scores_csv(out_dir / "temporal_frame_scores.csv", indices, importance_scores, norm_scores, frame_probs)
+    save_scores_csv(
+        out_dir / "temporal_frame_scores.csv",
+        indices,
+        sampled_paths,
+        importance_scores,
+        norm_scores,
+        frame_probs,
+    )
     timeline = save_timeline(
         frames,
         indices,
