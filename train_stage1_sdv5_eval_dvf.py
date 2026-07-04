@@ -86,6 +86,18 @@ def parse_args():
     parser.add_argument("--batch_size", default=128, type=int)
     parser.add_argument("--num_workers", default=16, type=int)
     parser.add_argument("--val_ratio", default=0.05, type=float)
+    parser.add_argument(
+        "--train_real_frames",
+        default=0,
+        type=int,
+        help="Number of real/nature SDV5 training frames to use after val split. 0 means all.",
+    )
+    parser.add_argument(
+        "--train_fake_frames",
+        default=0,
+        type=int,
+        help="Number of fake/ai SDV5 training frames to use after val split. 0 means all.",
+    )
     parser.add_argument("--lr", default=1e-4, type=float)
     parser.add_argument("--warmup_steps", default=512, type=int)
     parser.add_argument("--supcon_weight", default=1 / 16, type=float)
@@ -247,7 +259,14 @@ def discover_sdv5_images(root: str):
     return real_entries, fake_entries
 
 
-def split_entries(real_entries, fake_entries, val_ratio: float, seed: int):
+def split_entries(
+    real_entries,
+    fake_entries,
+    val_ratio: float,
+    seed: int,
+    train_real_frames: int = 0,
+    train_fake_frames: int = 0,
+):
     rng = np.random.default_rng(seed)
     real = list(real_entries)
     fake = list(fake_entries)
@@ -258,7 +277,28 @@ def split_entries(real_entries, fake_entries, val_ratio: float, seed: int):
     fake_val_n = max(1, int(len(fake) * val_ratio)) if len(fake) > 1 else 0
 
     val_entries = real[:real_val_n] + fake[:fake_val_n]
-    train_entries = real[real_val_n:] + fake[fake_val_n:]
+    real_train = real[real_val_n:]
+    fake_train = fake[fake_val_n:]
+
+    if train_real_frames > 0:
+        if train_real_frames > len(real_train):
+            print(
+                f"Requested {train_real_frames} real train frames, "
+                f"but only {len(real_train)} available; using all."
+            )
+        else:
+            real_train = real_train[:train_real_frames]
+
+    if train_fake_frames > 0:
+        if train_fake_frames > len(fake_train):
+            print(
+                f"Requested {train_fake_frames} fake train frames, "
+                f"but only {len(fake_train)} available; using all."
+            )
+        else:
+            fake_train = fake_train[:train_fake_frames]
+
+    train_entries = real_train + fake_train
     rng.shuffle(train_entries)
     rng.shuffle(val_entries)
 
@@ -544,7 +584,14 @@ def main():
     print("Labels: nature=real(0), ai=fake(1)")
 
     real_entries, fake_entries = discover_sdv5_images(args.sdv5_root)
-    train_entries, val_entries = split_entries(real_entries, fake_entries, args.val_ratio, args.seed)
+    train_entries, val_entries = split_entries(
+        real_entries,
+        fake_entries,
+        args.val_ratio,
+        args.seed,
+        train_real_frames=args.train_real_frames,
+        train_fake_frames=args.train_fake_frames,
+    )
 
     train_dataset = ImageEntriesDataset(train_entries, train=True)
     val_dataset = ImageEntriesDataset(val_entries, train=False)
