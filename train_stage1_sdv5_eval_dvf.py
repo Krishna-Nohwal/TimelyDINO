@@ -62,6 +62,24 @@ def parse_args():
     parser.add_argument("--sdv5_root", required=True, type=str)
     parser.add_argument("--dvf_root", required=True, type=str)
     parser.add_argument("--dvf_manifest", required=True, type=str)
+    parser.add_argument(
+        "--dvf_real_videos",
+        default=0,
+        type=int,
+        help="Number of real DVF videos to evaluate. 0 means use all real videos.",
+    )
+    parser.add_argument(
+        "--dvf_fake_videos",
+        default=0,
+        type=int,
+        help="Number of fake DVF videos to evaluate. 0 means use all fake videos.",
+    )
+    parser.add_argument(
+        "--dvf_sample_seed",
+        default=42,
+        type=int,
+        help="Seed used when subsampling DVF real/fake videos.",
+    )
     parser.add_argument("--save_root", default="checkpoints_stage1_sdv5_dvf", type=str)
     parser.add_argument("--load_from", default="", type=str)
     parser.add_argument("--epochs", default=50, type=int)
@@ -280,7 +298,14 @@ def extract_video_id(sample_dir: str) -> str:
 
 
 class DVFFrameDataset(Dataset):
-    def __init__(self, manifest_csv: str, root_dir: str):
+    def __init__(
+        self,
+        manifest_csv: str,
+        root_dir: str,
+        real_videos: int = 0,
+        fake_videos: int = 0,
+        sample_seed: int = 42,
+    ):
         df = pd.read_csv(manifest_csv)
         required = {"sample_dir", "label"}
         if not required.issubset(df.columns):
@@ -307,6 +332,7 @@ class DVFFrameDataset(Dataset):
             else:
                 skipped += 1
 
+        rows = self._subsample_videos(rows, real_videos, fake_videos, sample_seed)
         self.rows = rows
         print(
             f"DVF frames -> Real: {sum(r[1] == 0 for r in rows)} | "
@@ -326,6 +352,44 @@ class DVFFrameDataset(Dataset):
             print(f"  [DVF] skipped missing image.png rows: {skipped}")
         if not rows:
             raise RuntimeError("No DVF frames found.")
+
+    @staticmethod
+    def _subsample_videos(rows, real_videos: int, fake_videos: int, sample_seed: int):
+        if real_videos <= 0 and fake_videos <= 0:
+            return rows
+
+        video_labels = {}
+        for row in rows:
+            _, label, video_id, _, _ = row
+            video_labels[str(video_id)] = int(label)
+
+        real_ids = sorted([vid for vid, label in video_labels.items() if label == 0])
+        fake_ids = sorted([vid for vid, label in video_labels.items() if label == 1])
+        rng = np.random.default_rng(sample_seed)
+
+        def choose(ids, requested, name):
+            if requested <= 0:
+                print(f"DVF {name} video sampling: using all {len(ids)} videos")
+                return set(ids)
+            if requested > len(ids):
+                print(
+                    f"DVF {name} video sampling: requested {requested}, "
+                    f"but only {len(ids)} available; using all"
+                )
+                return set(ids)
+            selected = sorted(rng.choice(ids, size=requested, replace=False).tolist())
+            print(f"DVF {name} video sampling: selected {len(selected)} / {len(ids)} videos")
+            return set(selected)
+
+        keep_real = choose(real_ids, real_videos, "real")
+        keep_fake = choose(fake_ids, fake_videos, "fake")
+        keep = keep_real | keep_fake
+        filtered = [row for row in rows if str(row[2]) in keep]
+        print(
+            f"DVF video subsample -> real videos: {len(keep_real)} | "
+            f"fake videos: {len(keep_fake)} | frames: {len(filtered)}"
+        )
+        return filtered
 
     def __len__(self):
         return len(self.rows)
@@ -484,7 +548,13 @@ def main():
 
     train_dataset = ImageEntriesDataset(train_entries, train=True)
     val_dataset = ImageEntriesDataset(val_entries, train=False)
-    dvf_dataset = DVFFrameDataset(args.dvf_manifest, args.dvf_root)
+    dvf_dataset = DVFFrameDataset(
+        args.dvf_manifest,
+        args.dvf_root,
+        real_videos=args.dvf_real_videos,
+        fake_videos=args.dvf_fake_videos,
+        sample_seed=args.dvf_sample_seed,
+    )
     audit_dvf_leakage(train_entries, val_entries, dvf_dataset, args.hash_leak_check)
 
     persistent = args.num_workers > 0
