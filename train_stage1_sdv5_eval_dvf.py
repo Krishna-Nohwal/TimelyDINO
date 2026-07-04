@@ -20,9 +20,11 @@ Example:
 """
 
 import argparse
+import hashlib
 import math
 import os
 import random
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
@@ -73,6 +75,11 @@ def parse_args():
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument(
+        "--hash_leak_check",
+        action="store_true",
+        help="Also compare 256x256 RGB image hashes between SDV5 train/val and DVF.",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +99,39 @@ def clean_state_dict(obj):
     return state
 
 
+def atomic_torch_save(obj, path: Path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    try:
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def link_or_copy_checkpoint(src: Path, dst: Path) -> str:
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+        return "hardlink"
+    except OSError as exc:
+        print(f"  Could not hard-link best checkpoint ({exc}); falling back to copy.")
+        shutil.copy2(src, dst)
+        return "copy"
+
+
 def load_image(path: str, train: bool) -> torch.Tensor:
     image = Image.open(path).convert("RGB")
     image = image.resize((IMG_SIZE, IMG_SIZE), Image.BICUBIC)
@@ -100,6 +140,68 @@ def load_image(path: str, train: bool) -> torch.Tensor:
     arr = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(arr).permute(2, 0, 1)
     return (tensor - IMAGENET_MEAN) / IMAGENET_STD
+
+
+def image_content_hash(path: str) -> str:
+    image = Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE), Image.BICUBIC)
+    return hashlib.sha256(np.asarray(image, dtype=np.uint8).tobytes()).hexdigest()
+
+
+def audit_dvf_leakage(train_entries, val_entries, dvf_dataset, hash_check: bool):
+    train_paths = {str(Path(path).expanduser().resolve()) for path, _ in train_entries}
+    val_paths = {str(Path(path).expanduser().resolve()) for path, _ in val_entries}
+    dvf_paths = {str(Path(row[0]).expanduser().resolve()) for row in dvf_dataset.rows}
+
+    train_overlap = train_paths & dvf_paths
+    val_overlap = val_paths & dvf_paths
+
+    print("\nLeakage audit: SDV5 vs DVF")
+    print(f"  SDV5 train images: {len(train_paths)}")
+    print(f"  SDV5 val images:   {len(val_paths)}")
+    print(f"  DVF eval frames:   {len(dvf_paths)}")
+    print(f"  exact path overlap train vs DVF: {len(train_overlap)}")
+    print(f"  exact path overlap val   vs DVF: {len(val_overlap)}")
+
+    if train_overlap or val_overlap:
+        examples = sorted((train_overlap | val_overlap))[:10]
+        for path in examples:
+            print(f"    overlap: {path}")
+        raise RuntimeError("DVF leakage detected: exact file path overlap with SDV5.")
+
+    if not hash_check:
+        print("  image hash overlap: skipped (pass --hash_leak_check to enable)")
+        print("Leakage audit passed: no exact path overlap.\n")
+        return
+
+    print("  Computing 256x256 RGB image hashes for content-overlap check ...")
+    train_hashes = defaultdict(list)
+    val_hashes = defaultdict(list)
+    dvf_hashes = defaultdict(list)
+
+    for path, _ in tqdm(train_entries, desc="Hash SDV5 train", leave=False):
+        train_hashes[image_content_hash(path)].append(path)
+    for path, _ in tqdm(val_entries, desc="Hash SDV5 val", leave=False):
+        val_hashes[image_content_hash(path)].append(path)
+    for image_path, _, _, _, _ in tqdm(dvf_dataset.rows, desc="Hash DVF", leave=False):
+        dvf_hashes[image_content_hash(image_path)].append(image_path)
+
+    train_hash_overlap = set(train_hashes) & set(dvf_hashes)
+    val_hash_overlap = set(val_hashes) & set(dvf_hashes)
+    print(f"  image hash overlap train vs DVF: {len(train_hash_overlap)}")
+    print(f"  image hash overlap val   vs DVF: {len(val_hash_overlap)}")
+
+    if train_hash_overlap or val_hash_overlap:
+        for digest in sorted(train_hash_overlap | val_hash_overlap)[:5]:
+            print(f"    hash overlap: {digest}")
+            for path in train_hashes.get(digest, [])[:3]:
+                print(f"      train: {path}")
+            for path in val_hashes.get(digest, [])[:3]:
+                print(f"      val:   {path}")
+            for path in dvf_hashes.get(digest, [])[:3]:
+                print(f"      dvf:   {path}")
+        raise RuntimeError("DVF leakage detected: image-content hash overlap with SDV5.")
+
+    print("Leakage audit passed: no exact path or image-content overlap.\n")
 
 
 def discover_sdv5_images(root: str):
@@ -383,6 +485,7 @@ def main():
     train_dataset = ImageEntriesDataset(train_entries, train=True)
     val_dataset = ImageEntriesDataset(val_entries, train=False)
     dvf_dataset = DVFFrameDataset(args.dvf_manifest, args.dvf_root)
+    audit_dvf_leakage(train_entries, val_entries, dvf_dataset, args.hash_leak_check)
 
     persistent = args.num_workers > 0
     prefetch = 4 if args.num_workers > 0 else None
@@ -534,15 +637,18 @@ def main():
         state_dict = live_model.state_dict()
         latest_path = Path(args.save_root) / "latest.pth"
         best_path = Path(args.save_root) / "best.pth"
-        torch.save(state_dict, latest_path)
+        atomic_torch_save(state_dict, latest_path)
         live_model.vit.save_pretrained(Path(args.save_root) / "latest_lora")
 
         if dvf_video_auc > best_dvf_video_auc:
             best_dvf_video_auc = dvf_video_auc
             best_epoch = epoch
-            torch.save(state_dict, best_path)
+            link_mode = link_or_copy_checkpoint(latest_path, best_path)
             live_model.vit.save_pretrained(Path(args.save_root) / "best_lora")
-            print(f"\n  * New best DVF video-mean AUC={best_dvf_video_auc:.4f} -> saved best.pth")
+            print(
+                f"\n  * New best DVF video-mean AUC={best_dvf_video_auc:.4f} "
+                f"-> saved best.pth ({link_mode})"
+            )
         else:
             print(f"\n  Best so far: epoch {best_epoch + 1}  DVF video-mean AUC={best_dvf_video_auc:.4f}")
 
