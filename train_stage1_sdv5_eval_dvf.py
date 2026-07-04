@@ -51,7 +51,6 @@ from frame_model import ViT
 
 IMG_SIZE = 256
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -86,18 +85,23 @@ def parse_args():
         "--genvideo_root",
         default="",
         type=str,
-        help="Path to GenVideo root containing OpenSora and ZeroScope.",
+        help="Path to extracted GenVideo frame root, e.g. /media/.../usr/genvideo_16f.",
     )
-    parser.add_argument("--genvideo_num_frames", default=16, type=int)
+    parser.add_argument(
+        "--genvideo_manifest",
+        default="",
+        type=str,
+        help="Path to extracted GenVideo manifest_genvideo_16f.csv.",
+    )
     parser.add_argument("--save_root", default="checkpoints_stage1_sdv5_dvf", type=str)
     parser.add_argument("--load_from", default="", type=str)
     parser.add_argument("--epochs", default=50, type=int)
     parser.add_argument("--batch_size", default=128, type=int)
     parser.add_argument(
         "--test_batch_size",
-        default=8,
+        default=128,
         type=int,
-        help="Evaluation batch size. For GenVideo this is videos per batch.",
+        help="Evaluation batch size in extracted frames.",
     )
     parser.add_argument("--num_workers", default=16, type=int)
     parser.add_argument("--val_ratio", default=0.05, type=float)
@@ -365,11 +369,12 @@ class DVFFrameDataset(Dataset):
         real_videos: int = 0,
         fake_videos: int = 0,
         sample_seed: int = 42,
+        dataset_name: str = "DVF",
     ):
         df = pd.read_csv(manifest_csv)
         required = {"sample_dir", "label"}
         if not required.issubset(df.columns):
-            raise ValueError(f"DVF manifest must contain {required}. Found {list(df.columns)}")
+            raise ValueError(f"{dataset_name} manifest must contain {required}. Found {list(df.columns)}")
 
         root = Path(root_dir).expanduser()
         rows = []
@@ -395,11 +400,11 @@ class DVFFrameDataset(Dataset):
         rows = self._subsample_videos(rows, real_videos, fake_videos, sample_seed)
         self.rows = rows
         print(
-            f"DVF frames -> Real: {sum(r[1] == 0 for r in rows)} | "
+            f"{dataset_name} frames -> Real: {sum(r[1] == 0 for r in rows)} | "
             f"Fake: {sum(r[1] == 1 for r in rows)} | Total: {len(rows)}"
         )
-        print(f"DVF videos -> {len(set(r[2] for r in rows))}")
-        print("DVF subsets:")
+        print(f"{dataset_name} videos -> {len(set(r[2] for r in rows))}")
+        print(f"{dataset_name} subsets:")
         for source in sorted(set(r[4] for r in rows)):
             source_rows = [r for r in rows if r[4] == source]
             source_videos = set(r[2] for r in source_rows)
@@ -409,9 +414,9 @@ class DVFFrameDataset(Dataset):
                 f"fake_frames={sum(r[1] == 1 for r in source_rows)}"
             )
         if skipped:
-            print(f"  [DVF] skipped missing image.png rows: {skipped}")
+            print(f"  [{dataset_name}] skipped missing image.png rows: {skipped}")
         if not rows:
-            raise RuntimeError("No DVF frames found.")
+            raise RuntimeError(f"No {dataset_name} frames found.")
 
     @staticmethod
     def _subsample_videos(rows, real_videos: int, fake_videos: int, sample_seed: int):
@@ -457,112 +462,6 @@ class DVFFrameDataset(Dataset):
     def __getitem__(self, idx):
         image_path, label, video_id, sample_dir, source = self.rows[idx]
         return load_image(image_path, train=False), int(label), video_id, sample_dir, source
-
-
-def normalize_source_name(name: str) -> str:
-    lowered = name.lower().replace("_", "").replace("-", "")
-    if "opensora" in lowered:
-        return "opensora"
-    if "zeroscope" in lowered:
-        return "zeroscope"
-    return name.lower()
-
-
-class GenVideoDataset(Dataset):
-    """Raw GenVideo video dataset. All videos are fake (label=1)."""
-
-    def __init__(self, root_dir: str, num_frames: int = 16):
-        root = Path(root_dir).expanduser()
-        if not root.is_dir():
-            raise FileNotFoundError(f"GenVideo root not found: {root}")
-
-        rows = []
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
-                continue
-            rel = path.relative_to(root)
-            source = normalize_source_name(rel.parts[0] if rel.parts else path.parent.name)
-            video_id = rel.with_suffix("").as_posix()
-            rows.append((str(path), 1, video_id, source))
-
-        self.rows = rows
-        self.num_frames = int(num_frames)
-        print(f"GenVideo videos -> Fake: {len(rows)} | Real: 0 | Total: {len(rows)}")
-        print("GenVideo subsets:")
-        for source in sorted(set(row[3] for row in rows)):
-            count = sum(row[3] == source for row in rows)
-            print(f"  {source}: videos={count} frames_per_video={self.num_frames}")
-        if not rows:
-            raise RuntimeError(f"No GenVideo videos found under {root}")
-
-    def __len__(self):
-        return len(self.rows)
-
-    @staticmethod
-    def _read_frame_at(cap, frame_idx: int):
-        import cv2
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            return None
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(frame).convert("RGB")
-
-    @staticmethod
-    def _read_all_frames(video_path: str):
-        import cv2
-
-        cap = cv2.VideoCapture(str(video_path))
-        frames = []
-        idx = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append((idx, Image.fromarray(frame).convert("RGB")))
-            idx += 1
-        cap.release()
-        return frames
-
-    def _sample_frames(self, video_path: str) -> tuple[torch.Tensor, int]:
-        import cv2
-
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video: {video_path}")
-
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        images = []
-        if total > 0:
-            targets = np.linspace(0, max(total - 1, 0), self.num_frames)
-            targets = np.round(targets).astype(int).tolist()
-            for target in targets:
-                image = self._read_frame_at(cap, target)
-                if image is None:
-                    images = []
-                    break
-                images.append(image)
-        cap.release()
-
-        if len(images) != self.num_frames:
-            all_frames = self._read_all_frames(video_path)
-            if not all_frames:
-                raise RuntimeError(f"No decodable frames in video: {video_path}")
-            targets = np.linspace(0, len(all_frames) - 1, self.num_frames)
-            targets = np.round(targets).astype(int).tolist()
-            images = [all_frames[i][1] for i in targets]
-            total = len(all_frames)
-
-        frames = torch.stack([image_to_tensor(image) for image in images], dim=0)
-        return frames, int(total)
-
-    def __getitem__(self, idx):
-        video_path, label, video_id, source = self.rows[idx]
-        frames, total = self._sample_frames(video_path)
-        return frames, int(label), video_id, source, video_path, total
-
 
 def compute_metrics(labels, probs, split_name: str, epoch: int):
     labels = np.asarray(labels, dtype=np.int64)
@@ -695,53 +594,6 @@ def eval_dvf(model, loader, desc: str, device: torch.device, amp_enabled: bool):
         }
     return frame_labels, frame_probs, vid_labels, vid_probs, subset_metrics
 
-
-@torch.no_grad()
-def eval_genvideo(model, loader, desc: str, device: torch.device, amp_enabled: bool):
-    model.eval()
-    frame_labels, frame_probs = [], []
-    video_labels, video_probs = [], []
-    subset_frame_labels = defaultdict(list)
-    subset_frame_probs = defaultdict(list)
-    subset_video_labels = defaultdict(list)
-    subset_video_probs = defaultdict(list)
-
-    for frames, labels, video_ids, sources, _, totals in tqdm(loader, desc=desc, leave=False):
-        # frames: (B, T, C, H, W)
-        bsz, time_steps, channels, height, width = frames.shape
-        flat = frames.reshape(bsz * time_steps, channels, height, width).to(device, non_blocking=True)
-        with autocast_context(device, amp_enabled):
-            logits_list, _, _ = model(flat)
-            probs = torch.softmax(logits_list[3].float(), dim=1)[:, 1]
-        probs = probs.reshape(bsz, time_steps).cpu().numpy()
-
-        label_list = labels.numpy().astype(int).tolist()
-        for i, (label, video_id, source) in enumerate(zip(label_list, video_ids, sources)):
-            source = str(source)
-            frame_prob_list = probs[i].astype(float).tolist()
-            video_prob = float(np.mean(frame_prob_list))
-
-            frame_labels.extend([int(label)] * time_steps)
-            frame_probs.extend(frame_prob_list)
-            video_labels.append(int(label))
-            video_probs.append(video_prob)
-
-            subset_frame_labels[source].extend([int(label)] * time_steps)
-            subset_frame_probs[source].extend(frame_prob_list)
-            subset_video_labels[source].append(int(label))
-            subset_video_probs[source].append(video_prob)
-
-    subset_metrics = {}
-    for source in sorted(subset_video_labels):
-        subset_metrics[source] = {
-            "frame_labels": subset_frame_labels[source],
-            "frame_probs": subset_frame_probs[source],
-            "video_labels": subset_video_labels[source],
-            "video_probs": subset_video_probs[source],
-        }
-    return frame_labels, frame_probs, video_labels, video_probs, subset_metrics
-
-
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -775,14 +627,22 @@ def main():
             real_videos=args.dvf_real_videos,
             fake_videos=args.dvf_fake_videos,
             sample_seed=args.dvf_sample_seed,
+            dataset_name="DVF",
         )
         audit_dvf_leakage(train_entries, val_entries, test_dataset, args.hash_leak_check)
     else:
-        if not args.genvideo_root:
-            raise ValueError("--genvideo_root is required when --test_dataset genvideo")
+        if not args.genvideo_root or not args.genvideo_manifest:
+            raise ValueError("--genvideo_root and --genvideo_manifest are required when --test_dataset genvideo")
         if args.hash_leak_check:
-            print("--hash_leak_check is only implemented for extracted-frame DVF; skipping for GenVideo.")
-        test_dataset = GenVideoDataset(args.genvideo_root, num_frames=args.genvideo_num_frames)
+            print("--hash_leak_check is only implemented for DVF in this script; skipping for GenVideo.")
+        test_dataset = DVFFrameDataset(
+            args.genvideo_manifest,
+            args.genvideo_root,
+            real_videos=0,
+            fake_videos=0,
+            sample_seed=args.dvf_sample_seed,
+            dataset_name="GenVideo",
+        )
 
     persistent = args.num_workers > 0
     prefetch = 4 if args.num_workers > 0 else None
@@ -933,7 +793,7 @@ def main():
             test_score = video_metric
             best_metric_name = "DVF video-mean AUC"
         else:
-            test_fl, test_fp, test_vl, test_vp, test_subsets = eval_genvideo(
+            test_fl, test_fp, test_vl, test_vp, test_subsets = eval_dvf(
                 model, test_loader, f"Epoch {epoch + 1} [GenVideo]", device, amp_enabled
             )
             compute_metrics_safe(test_fl, test_fp, "GenVideo Frame ", epoch)
