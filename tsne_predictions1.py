@@ -18,9 +18,9 @@ fusion_classifier) and extracts:
   * video_label        : ground truth (0 = Real, 1 = Fake).
   * dataset            : 'FFPP' | 'CDFv2' | 'WDF' | 'UADFV' | 'DFo'.
 
-All embeddings across the datasets are sampled with the same number of videos
-per dataset, stacked, jointly reduced to 2D with a single UMAP fit (so the
-datasets sit in one shared space), and plotted in several paper-friendly views:
+All embeddings across the datasets are stacked, jointly reduced to 2D with a
+single UMAP fit (so the datasets sit in one shared space), and plotted in
+several paper-friendly views:
 dataset+label, label-only, predicted P(fake), correctness, and real/fake split.
 
 Model / architecture notes (see video_model.py and train_stage2_frame_end.py)
@@ -680,9 +680,8 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--max_videos_per_dataset", type=int, default=0,
-                   help="Equal number of videos to sample from each dataset "
-                        "(0 = use the smallest available dataset size). "
-                        "Sampling is stratified by real/fake where possible.")
+                   help="Optional cap per dataset. 0 = use all available videos "
+                        "from every dataset.")
     p.add_argument("--no_compile", action="store_true")
     p.add_argument("--fp32", action="store_true")
     p.add_argument("--out", default="umap_predictions.png",
@@ -711,8 +710,7 @@ def parse_args():
     p.add_argument("--cdfv2_fake_root", default="")
     p.add_argument("--cdfv2_real_root", default="")
 
-    # DFo / DeeperForensics-1.0 style nested roots. df0 aliases are accepted
-    # because the dataset is often typed that way in local notes.
+    # DFo / DeeperForensics-1.0 style nested roots.
     p.add_argument("--df0_fake_root", default="")
     p.add_argument("--df0_real_root", default="")
 
@@ -754,7 +752,7 @@ def _stratified_cap(videos: List[Tuple[str, List[str], int]], cap: int, seed: in
     return reals + fakes
 
 
-def _dataset_balanced_items(
+def _dataset_sampled_items(
     dataset_videos: dict,
     videos_per_dataset: int,
 ) -> List[Tuple[str, List[str], int, str]]:
@@ -762,33 +760,38 @@ def _dataset_balanced_items(
     if not available:
         return []
 
-    smallest = min(available.values())
-    target = smallest if videos_per_dataset <= 0 else min(videos_per_dataset, smallest)
-    print("\n  Dataset balancing:")
+    print("\n  Dataset sampling:")
     for name, count in available.items():
-        print(f"    {name}: available={count}  sampled={target}")
-    if videos_per_dataset > 0 and videos_per_dataset > smallest:
-        print(
-            f"    Requested {videos_per_dataset} per dataset, but the smallest "
-            f"dataset has {smallest}. Using {target} each."
-        )
+        sampled_count = count if videos_per_dataset <= 0 else min(videos_per_dataset, count)
+        print(f"    {name}: available={count}  sampled={sampled_count}")
 
-    balanced = []
+    sampled_items = []
     for seed, (name, videos) in enumerate(sorted(dataset_videos.items()), start=10):
-        sampled = _stratified_cap(videos, target, seed=seed)
+        sampled = _stratified_cap(videos, videos_per_dataset, seed=seed)
         rng = np.random.default_rng(seed + 1000)
         order = rng.permutation(len(sampled))
         sampled = [sampled[i] for i in order]
         n_real = sum(1 for _, _, label in sampled if label == 0)
         n_fake = sum(1 for _, _, label in sampled if label == 1)
         print(f"    {name}: final real={n_real}  fake={n_fake}")
-        balanced.extend((vid, paths, label, name) for vid, paths, label in sampled)
-    return balanced
+        sampled_items.extend((vid, paths, label, name) for vid, paths, label in sampled)
+    return sampled_items
 
 
 def _output_with_suffix(out_path: str, suffix: str) -> str:
     path = Path(out_path)
     return str(path.with_name(f"{path.stem}_{suffix}{path.suffix}"))
+
+
+def _set_tight_limits(ax, points: np.ndarray, pad_frac: float = 0.06):
+    if points.size == 0:
+        return
+    x_min, y_min = points.min(axis=0)
+    x_max, y_max = points.max(axis=0)
+    x_span = max(float(x_max - x_min), 1e-6)
+    y_span = max(float(y_max - y_min), 1e-6)
+    ax.set_xlim(x_min - pad_frac * x_span, x_max + pad_frac * x_span)
+    ax.set_ylim(y_min - pad_frac * y_span, y_max + pad_frac * y_span)
 
 
 def _default_embeddings_path(out_path: str) -> str:
@@ -908,7 +911,7 @@ def main():
         else:
             print("\n  [skip] UADFV: --uadfv_fake_root / --uadfv_real_root not provided.")
 
-        all_videos: List[Tuple[str, List[str], int, str]] = _dataset_balanced_items(
+        all_videos: List[Tuple[str, List[str], int, str]] = _dataset_sampled_items(
             dataset_videos, args.max_videos_per_dataset
         )
 
@@ -1004,11 +1007,11 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
     datasets = [d for d in preferred_order if d in present]
     datasets.extend(sorted(present - set(datasets)))
     base_colors = {
-        "FFPP": "#4C72B0",
-        "CDFv2": "#DD8452",
-        "DFo": "#55A868",
-        "WDF": "#C44E52",
-        "UADFV": "#8172B3",
+        "FFPP": "#0057FF",   # blue
+        "CDFv2": "#E31A1C",  # red
+        "WDF": "#000000",    # black
+        "UADFV": "#FFD700",  # yellow
+        "DFo": "#FF4FB3",    # pink
     }
     fallback_colors = plt.get_cmap("tab20").colors
     dataset_colors = {
@@ -1018,7 +1021,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
     saved = []
 
     # -- Main: colored by dataset, marker by real/fake -----------------------
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    fig, ax = plt.subplots(1, 1, figsize=(6.6, 5.2))
     for dset in datasets:
         mask_d = dataset_tags == dset
         for label, marker, name in [(0, "o", "Real"), (1, "^", "Fake")]:
@@ -1028,13 +1031,14 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
             ax.scatter(
                 coords[mask, 0], coords[mask, 1],
                 c=dataset_colors[dset], marker=marker,
-                s=28, alpha=0.7, linewidths=0.3, edgecolors="black",
+                s=10, alpha=0.82, linewidths=0.1, edgecolors="black",
                 label=f"{dset} - {name}",
             )
     ax.set_title("UMAP of video embeddings\ncolor = dataset, shape = real/fake")
     ax.set_xlabel("UMAP dim 1")
     ax.set_ylabel("UMAP dim 2")
     ax.legend(fontsize=8, loc="best", markerscale=1.2)
+    _set_tight_limits(ax, coords)
     fig.tight_layout()
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -1042,7 +1046,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
 
     # -- Label-only view ------------------------------------------------------
     label_path = _output_with_suffix(out_path, "label")
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    fig, ax = plt.subplots(1, 1, figsize=(6.6, 5.2))
     label_styles = {
         0: ("#2E7D32", "o", "Real"),
         1: ("#C62828", "^", "Fake"),
@@ -1053,13 +1057,14 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
             continue
         ax.scatter(
             coords[mask, 0], coords[mask, 1],
-            c=color, marker=marker, s=30, alpha=0.75,
-            linewidths=0.3, edgecolors="black", label=name,
+            c=color, marker=marker, s=10, alpha=0.82,
+            linewidths=0.1, edgecolors="black", label=name,
         )
     ax.set_title("UMAP of video embeddings\ncolor = real/fake")
     ax.set_xlabel("UMAP dim 1")
     ax.set_ylabel("UMAP dim 2")
     ax.legend(fontsize=9, loc="best")
+    _set_tight_limits(ax, coords)
     fig.tight_layout()
     fig.savefig(label_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -1067,16 +1072,17 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
 
     # -- Predicted probability view ------------------------------------------
     prob_path = _output_with_suffix(out_path, "prob")
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    fig, ax = plt.subplots(1, 1, figsize=(6.6, 5.2))
     sc = ax.scatter(
         coords[:, 0], coords[:, 1], c=probs, cmap="coolwarm",
-        vmin=0, vmax=1, s=28, alpha=0.8, linewidths=0.3, edgecolors="black",
+        vmin=0, vmax=1, s=10, alpha=0.82, linewidths=0.1, edgecolors="black",
     )
     cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Predicted P(fake)")
     ax.set_title("UMAP of video embeddings\ncolor = model's predicted P(fake)")
     ax.set_xlabel("UMAP dim 1")
     ax.set_ylabel("UMAP dim 2")
+    _set_tight_limits(ax, coords)
     fig.tight_layout()
     fig.savefig(prob_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -1086,7 +1092,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
     correct_path = _output_with_suffix(out_path, "correctness")
     preds = (probs >= 0.5).astype(int)
     correct = preds == labels
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    fig, ax = plt.subplots(1, 1, figsize=(6.6, 5.2))
     for mask, color, marker, name in [
         (correct, "#4C72B0", "o", "Correct"),
         (~correct, "#D62728", "x", "Wrong"),
@@ -1095,14 +1101,15 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
             continue
         ax.scatter(
             coords[mask, 0], coords[mask, 1],
-            c=color, marker=marker, s=34, alpha=0.8,
-            linewidths=0.7, edgecolors="black" if marker != "x" else color,
+            c=color, marker=marker, s=12, alpha=0.82,
+            linewidths=0.55, edgecolors="black" if marker != "x" else color,
             label=name,
         )
     ax.set_title("UMAP of video embeddings\ncolor = prediction correctness")
     ax.set_xlabel("UMAP dim 1")
     ax.set_ylabel("UMAP dim 2")
     ax.legend(fontsize=9, loc="best")
+    _set_tight_limits(ax, coords)
     fig.tight_layout()
     fig.savefig(correct_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -1110,21 +1117,23 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
 
     # -- Split real/fake panels ----------------------------------------------
     split_path = _output_with_suffix(out_path, "real_fake_split")
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.4))
     for ax, label, title in [(axes[0], 0, "Real videos"), (axes[1], 1, "Fake videos")]:
+        panel_mask = labels == label
         for dset in datasets:
             mask = (labels == label) & (dataset_tags == dset)
             if mask.sum() == 0:
                 continue
             ax.scatter(
                 coords[mask, 0], coords[mask, 1],
-                c=dataset_colors[dset], s=22, alpha=0.8,
-                linewidths=0.2, edgecolors="black", label=dset,
+                c=dataset_colors[dset], s=8, alpha=0.84,
+                linewidths=0.08, edgecolors="black", label=dset,
             )
         ax.set_title(title)
         ax.set_xlabel("UMAP dim 1")
         ax.set_ylabel("UMAP dim 2")
         ax.legend(fontsize=8, loc="best")
+        _set_tight_limits(ax, coords[panel_mask])
     fig.suptitle("UMAP split by class")
     fig.tight_layout()
     fig.savefig(split_path, dpi=180, bbox_inches="tight")
