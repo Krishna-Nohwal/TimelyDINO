@@ -23,8 +23,14 @@ python tsne_predictions1.py \
     --root_dir /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/ \
     --cdfv2_fake_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2 \
     --cdfv2_real_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real \
-    --dfo_fake_root /media/tarun/B482367C823642E2/usr/df1.0_faces/fake \
-    --dfo_real_root /media/tarun/B482367C823642E2/usr/df1.0_faces/real \
+    --cdfv3_root /media/tarun/B482367C823642E2/usr/cdfv3_face_crops \
+    --cdfv3_csv /media/tarun/B482367C823642E2/usr/cdfv3_face_crops/manifest_cdfv3_face_crops.csv \
+    --df0_fake_root /media/tarun/B482367C823642E2/usr/df1.0_faces/fake \
+    --df0_real_root /media/tarun/B482367C823642E2/usr/df1.0_faces/real \
+    --dfd_fake_root /media/tarun/B482367C823642E2/usr/dfd_faces/fake \
+    --dfd_real_root /media/tarun/B482367C823642E2/usr/dfd_faces/real \
+    --dfdc_fake_root /media/tarun/B482367C823642E2/usr/dfdc/fake \
+    --dfdc_real_root /media/tarun/B482367C823642E2/usr/dfdc/real \
     --wdf_fake_root /media/tarun/B482367C823642E2/usr/wdf/test/fake \
     --wdf_real_root /media/tarun/B482367C823642E2/usr/wdf/test/real \
     --uadfv_fake_root /media/tarun/B482367C823642E2/usr/uadfv_faces/fake \
@@ -54,11 +60,12 @@ from torch.utils.data import DataLoader, Dataset
 
 from tsne_predictions1 import (
     VideoViT,
-    _dataset_balanced_items,
+    _dataset_sampled_items,
     _load_frames,
     _sample_frame_indices,
     build_cdfv2_videos,
     build_cdfv3_videos,
+    build_dfdc_videos,
     build_ffpp_videos,
     build_nested_image_videos,
     build_wdf_videos,
@@ -87,8 +94,8 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--max_videos_per_dataset", type=int, default=0,
-                   help="Equal number of videos to sample from each dataset "
-                        "(0 = use the smallest available dataset size).")
+                   help="Optional cap per dataset. 0 = use all available videos "
+                        "from every dataset.")
     p.add_argument("--no_compile", action="store_true")
 
     # FF++
@@ -96,7 +103,7 @@ def parse_args():
                    help="FF++ manifest CSV.")
     p.add_argument("--root_dir", default="",
                    help="FF++ frame root dir.")
-    p.add_argument("--val_ratio", type=float, default=0.05)
+    p.add_argument("--val_ratio", type=float, default=0.0)
 
     # CDFv2
     p.add_argument("--cdfv2_fake_root", default="")
@@ -105,6 +112,16 @@ def parse_args():
     # DFo / DeeperForensics-1.0 style nested roots
     p.add_argument("--dfo_fake_root", default="")
     p.add_argument("--dfo_real_root", default="")
+    p.add_argument("--df0_fake_root", default="")
+    p.add_argument("--df0_real_root", default="")
+
+    # DFD style nested roots
+    p.add_argument("--dfd_fake_root", default="")
+    p.add_argument("--dfd_real_root", default="")
+
+    # DFDC flat roots
+    p.add_argument("--dfdc_fake_root", default="")
+    p.add_argument("--dfdc_real_root", default="")
 
     # WDF flat roots
     p.add_argument("--wdf_fake_root", default="")
@@ -154,13 +171,31 @@ def build_video_items(args) -> List[Tuple[str, List[str], int, str]]:
     else:
         print("\n[skip] CDFv2: --cdfv2_fake_root / --cdfv2_real_root not provided.")
 
-    if args.dfo_fake_root and args.dfo_real_root:
+    dfo_fake_root = args.dfo_fake_root or args.df0_fake_root
+    dfo_real_root = args.dfo_real_root or args.df0_real_root
+    if dfo_fake_root and dfo_real_root:
         print("\nBuilding DFo video list ...")
         dataset_videos["DFo"] = build_nested_image_videos(
-            args.dfo_fake_root, args.dfo_real_root, "DFo"
+            dfo_fake_root, dfo_real_root, "DFo"
         )
     else:
-        print("\n[skip] DFo: --dfo_fake_root / --dfo_real_root not provided.")
+        print("\n[skip] DFo: --dfo_fake_root/--df0_fake_root and --dfo_real_root/--df0_real_root not provided.")
+
+    if args.dfd_fake_root and args.dfd_real_root:
+        print("\nBuilding DFD video list ...")
+        dataset_videos["DFD"] = build_nested_image_videos(
+            args.dfd_fake_root, args.dfd_real_root, "DFD"
+        )
+    else:
+        print("\n[skip] DFD: --dfd_fake_root / --dfd_real_root not provided.")
+
+    if args.dfdc_fake_root and args.dfdc_real_root:
+        print("\nBuilding DFDC video list ...")
+        dataset_videos["DFDC"] = build_dfdc_videos(
+            args.dfdc_fake_root, args.dfdc_real_root
+        )
+    else:
+        print("\n[skip] DFDC: --dfdc_fake_root / --dfdc_real_root not provided.")
 
     if args.wdf_fake_root and args.wdf_real_root:
         print("\nBuilding WDF video list ...")
@@ -178,15 +213,18 @@ def build_video_items(args) -> List[Tuple[str, List[str], int, str]]:
     else:
         print("\n[skip] UADFV: --uadfv_fake_root / --uadfv_real_root not provided.")
 
-    if args.cdfv3_root and args.cdfv3_csv:
-        print("\nBuilding CDFv3/CDF++ video list ...")
+    if args.cdfv3_root:
+        cdfv3_csv = args.cdfv3_csv or str(
+            Path(args.cdfv3_root) / "manifest_cdfv3_face_crops.csv"
+        )
+        print("\nBuilding CDFv3 video list ...")
         dataset_videos["CDFv3"] = build_cdfv3_videos(
-            args.cdfv3_root, args.cdfv3_csv
+            cdfv3_csv, args.cdfv3_root
         )
     else:
-        print("\n[skip] CDFv3/CDF++: --cdfv3_root / --cdfv3_csv not provided.")
+        print("\n[skip] CDFv3: --cdfv3_root not provided.")
 
-    items = _dataset_balanced_items(dataset_videos, args.max_videos_per_dataset)
+    items = _dataset_sampled_items(dataset_videos, args.max_videos_per_dataset)
     if not items:
         raise ValueError("No dataset items found. Provide at least one dataset.")
     return items
