@@ -91,9 +91,8 @@ python tsne_predictions1.py \
     --out umap_ffpp_cdfv2_wdf_uadfv_df0.png
 
 If --embeddings_out is omitted, embeddings are automatically cached next to the
-figure as <out_stem>_embeddings.npz before UMAP is imported.
-If --embeddings_out points to an existing file, that cache is reused unless
---force_extract is supplied.
+figure as <out_stem>_embeddings.npz before UMAP is imported. To reuse cached
+embeddings, pass the cache with --embeddings_npz.
 
 Any of --manifest/--root_dir, --cdfv2_fake_root/--cdfv2_real_root,
 --df0_fake_root/--df0_real_root, --wdf_fake_root/--wdf_real_root, or
@@ -384,12 +383,12 @@ def _extract_video_id_ffpp(sample_dir: str) -> str:
 
 
 def build_ffpp_videos(
-    manifest_csv: str, root_dir: str, val_ratio: float = 0.05
+    manifest_csv: str, root_dir: str, val_ratio: float = 0.0
 ) -> List[Tuple[str, List[str], int]]:
     """
-    Rebuilds the exact video-level val split used by train_stage2_frame_end.py
-    (prepare_splits, seed=42) and returns only the val videos, so we visualize
-    held-out FF++ videos rather than ones the model trained on directly.
+    Builds FF++ videos from the manifest. If val_ratio > 0, rebuilds the
+    video-level val split used by train_stage2_frame_end.py. If val_ratio <= 0,
+    uses every video in the manifest.
     """
     df = pd.read_csv(manifest_csv)
     required = {"sample_dir", "label"}
@@ -401,19 +400,22 @@ def build_ffpp_videos(
     real_vids = df[df["label"] == 0]["video_id"].unique()
     fake_vids = df[df["label"] == 1]["video_id"].unique()
 
-    rng = np.random.default_rng(42)
-    real_vids = rng.permutation(real_vids)
-    fake_vids = rng.permutation(fake_vids)
-
-    real_val_n = max(1, int(len(real_vids) * val_ratio))
-    fake_val_n = max(1, int(len(fake_vids) * val_ratio))
-    val_ids = set(real_vids[:real_val_n]) | set(fake_vids[:fake_val_n])
-
-    val_df = df[df["video_id"].isin(val_ids)].reset_index(drop=True)
+    if val_ratio > 0:
+        rng = np.random.default_rng(42)
+        real_vids = rng.permutation(real_vids)
+        fake_vids = rng.permutation(fake_vids)
+        real_val_n = max(1, int(len(real_vids) * val_ratio))
+        fake_val_n = max(1, int(len(fake_vids) * val_ratio))
+        selected_ids = set(real_vids[:real_val_n]) | set(fake_vids[:fake_val_n])
+        selected_df = df[df["video_id"].isin(selected_ids)].reset_index(drop=True)
+        split_name = f"val split ({val_ratio:.3f})"
+    else:
+        selected_df = df.reset_index(drop=True)
+        split_name = "all manifest videos"
 
     root = Path(root_dir)
     videos = []
-    for video_id, group in val_df.groupby("video_id"):
+    for video_id, group in selected_df.groupby("video_id"):
         label = int(group["label"].iloc[0])
         paths = []
         for rel in group["sample_dir"].astype(str).str.replace("\\", "/", regex=False):
@@ -426,7 +428,7 @@ def build_ffpp_videos(
 
     real_n = sum(1 for _, _, l in videos if l == 0)
     fake_n = sum(1 for _, _, l in videos if l == 1)
-    print(f"  [FF++ val split] {len(videos)} videos  (real={real_n}, fake={fake_n})")
+    print(f"  [FF++ {split_name}] {len(videos)} videos  (real={real_n}, fake={fake_n})")
     return videos
 
 
@@ -691,15 +693,15 @@ def parse_args():
                         "next to it with suffixes.")
     p.add_argument("--embeddings_out", default="",
                    help="Optional .npz path to cache raw embeddings/labels/probs "
-                        "(useful to re-plot without rerunning the model). If this "
-                        "file already exists, it is loaded unless --force_extract "
-                        "is set.")
+                        "(useful to re-plot without rerunning the model). This is "
+                        "only an output path; use --embeddings_npz to load a cache.")
     p.add_argument("--embeddings_npz", default="",
                    help="Optional cached .npz containing embeddings, labels, probs, "
                         "video_ids, and dataset_tags. If supplied, model inference "
                         "and dataset loading are skipped.")
     p.add_argument("--force_extract", action="store_true",
-                   help="Recompute embeddings even if --embeddings_out already exists.")
+                   help="Kept for backward compatibility; extraction is the default "
+                        "whenever --embeddings_npz is not supplied.")
     p.add_argument("--outlier_std", type=float, default=2.0,
                    help="Remove embedding outliers farther than mean + N*std "
                         "within each outlier group. Default 2.0 is stronger. "
@@ -713,7 +715,8 @@ def parse_args():
                    help="FF++ manifest CSV (train_stage2_frame_end.py format).")
     p.add_argument("--root_dir", default="",
                    help="FF++ frame root dir.")
-    p.add_argument("--val_ratio", type=float, default=0.05)
+    p.add_argument("--val_ratio", type=float, default=0.0,
+                   help="FF++ video validation split ratio. 0 = use all FF++ videos.")
 
     # CDFv2
     p.add_argument("--cdfv2_fake_root", default="")
@@ -770,9 +773,14 @@ def _dataset_sampled_items(
         return []
 
     print("\n  Dataset sampling:")
+    total_available = 0
+    total_sampled = 0
     for name, count in available.items():
         sampled_count = count if videos_per_dataset <= 0 else min(videos_per_dataset, count)
+        total_available += count
+        total_sampled += sampled_count
         print(f"    {name}: available={count}  sampled={sampled_count}")
+    print(f"    TOTAL: available={total_available}  sampled={total_sampled}")
 
     sampled_items = []
     for seed, (name, videos) in enumerate(sorted(dataset_videos.items()), start=10):
@@ -922,10 +930,6 @@ def main():
         embeddings, labels, probs, video_ids, dataset_tags = _load_cached_embeddings(
             args.embeddings_npz
         )
-    elif args.embeddings_out and Path(args.embeddings_out).is_file() and not args.force_extract:
-        embeddings, labels, probs, video_ids, dataset_tags = _load_cached_embeddings(
-            args.embeddings_out
-        )
     else:
         if not args.checkpoint:
             raise ValueError("Supply --checkpoint or --embeddings_npz.")
@@ -954,7 +958,7 @@ def main():
         dataset_videos = {}
 
         if args.manifest and args.root_dir:
-            print("\n  Building FF++ video list (val split only) ...")
+            print("\n  Building FF++ video list ...")
             dataset_videos["FFPP"] = build_ffpp_videos(
                 args.manifest, args.root_dir, args.val_ratio
             )
