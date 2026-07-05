@@ -1,5 +1,5 @@
 """
-tsne_predictions.py — t-SNE visualization of VideoViT video-level embeddings
+tsne_predictions.py — UMAP visualization of VideoViT video-level embeddings
                        and predictions across FF++ (val split), CDFv2, CDFv3.
 
 What this visualizes
@@ -18,14 +18,10 @@ fusion_classifier) and extracts:
   * video_label        : ground truth (0 = Real, 1 = Fake).
   * dataset            : 'FFPP' | 'CDFv2' | 'CDFv3'.
 
-All embeddings across the three datasets are stacked, jointly reduced to 2D
-with a single t-SNE fit (so the three datasets sit in one shared space), and
-plotted:
-
-  Panel 1 — colored by dataset, marker shape by real/fake.
-  Panel 2 — colored by the model's predicted P(fake) (a continuous colormap),
-            so you can see whether the geometry of the embedding space lines
-            up with confidence / correctness.
+All embeddings across the datasets are sampled with the same number of videos
+per dataset, stacked, jointly reduced to 2D with a single UMAP fit (so the
+datasets sit in one shared space), and plotted in several paper-friendly views:
+dataset+label, label-only, predicted P(fake), correctness, and real/fake split.
 
 Model / architecture notes (see video_model.py, train_stage2_frame_end.py,
 cdfv2_knn42.py, cdfv3_knn42.py)
@@ -80,7 +76,7 @@ python tsne_predictions1.py \
     --cdfv3_csv        /media/tarun/B482367C823642E2/usr/cdfv3_face_crops/manifest_cdfv3_face_crops.csv\
     --num_frames 32 --max_videos_per_dataset 300 \
     --train_real_root /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/real \
-    --out tsne_predictions.png
+    --out umap_predictions.png
 
 Any of --manifest/--root_dir, --cdfv2_fake_root/--cdfv2_real_root,
 --cdfv3_root/--cdfv3_csv may be omitted to skip that dataset.
@@ -622,7 +618,7 @@ def extract_embeddings(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="t-SNE of VideoViT video-level embeddings/predictions "
+        description="UMAP of VideoViT video-level embeddings/predictions "
                     "across FF++, CDFv2, and CDFv3."
     )
     p.add_argument("--checkpoint", required=True,
@@ -631,11 +627,14 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--max_videos_per_dataset", type=int, default=0,
-                   help="Cap videos per dataset for speed (0 = use all). "
+                   help="Equal number of videos to sample from each dataset "
+                        "(0 = use the smallest available dataset size). "
                         "Sampling is stratified by real/fake where possible.")
     p.add_argument("--no_compile", action="store_true")
     p.add_argument("--fp32", action="store_true")
-    p.add_argument("--out", default="tsne_predictions.png")
+    p.add_argument("--out", default="umap_predictions.png",
+                   help="Main all-in-one UMAP plot path. Extra views are saved "
+                        "next to it with suffixes.")
     p.add_argument("--embeddings_out", default="",
                    help="Optional .npz path to cache raw embeddings/labels/probs "
                         "(useful to re-plot without rerunning the model).")
@@ -662,9 +661,11 @@ def parse_args():
     p.add_argument("--knn_k", type=int, default=32)
     p.add_argument("--bank_batch_size", type=int, default=16)
 
-    # t-SNE params
-    p.add_argument("--perplexity", type=float, default=30.0)
-    p.add_argument("--tsne_seed", type=int, default=42)
+    # UMAP params
+    p.add_argument("--umap_neighbors", type=int, default=30)
+    p.add_argument("--umap_min_dist", type=float, default=0.15)
+    p.add_argument("--umap_metric", default="cosine")
+    p.add_argument("--umap_seed", type=int, default=42)
 
     return p.parse_args()
 
@@ -683,13 +684,50 @@ def _stratified_cap(videos: List[Tuple[str, List[str], int]], cap: int, seed: in
     return reals + fakes
 
 
+def _dataset_balanced_items(
+    dataset_videos: dict,
+    videos_per_dataset: int,
+) -> List[Tuple[str, List[str], int, str]]:
+    available = {name: len(videos) for name, videos in dataset_videos.items() if videos}
+    if not available:
+        return []
+
+    smallest = min(available.values())
+    target = smallest if videos_per_dataset <= 0 else min(videos_per_dataset, smallest)
+    print("\n  Dataset balancing:")
+    for name, count in available.items():
+        print(f"    {name}: available={count}  sampled={target}")
+    if videos_per_dataset > 0 and videos_per_dataset > smallest:
+        print(
+            f"    Requested {videos_per_dataset} per dataset, but the smallest "
+            f"dataset has {smallest}. Using {target} each."
+        )
+
+    balanced = []
+    for seed, (name, videos) in enumerate(sorted(dataset_videos.items()), start=10):
+        sampled = _stratified_cap(videos, target, seed=seed)
+        rng = np.random.default_rng(seed + 1000)
+        order = rng.permutation(len(sampled))
+        sampled = [sampled[i] for i in order]
+        n_real = sum(1 for _, _, label in sampled if label == 0)
+        n_fake = sum(1 for _, _, label in sampled if label == 1)
+        print(f"    {name}: final real={n_real}  fake={n_fake}")
+        balanced.extend((vid, paths, label, name) for vid, paths, label in sampled)
+    return balanced
+
+
+def _output_with_suffix(out_path: str, suffix: str) -> str:
+    path = Path(out_path)
+    return str(path.with_name(f"{path.stem}_{suffix}{path.suffix}"))
+
+
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
     sep = "=" * 78
-    print(f"\n{sep}\n  t-SNE of VideoViT predictions — FF++ / CDFv2 / CDFv3\n{sep}")
+    print(f"\n{sep}\n  UMAP of VideoViT predictions — FF++ / CDFv2 / CDFv3\n{sep}")
     print(f"  Device     : {device}")
     print(f"  Checkpoint : {args.checkpoint}")
 
@@ -713,31 +751,32 @@ def main():
         model = torch.compile(model)
 
     # ---- Build video lists per dataset -------------------------------------
-    all_videos: List[Tuple[str, List[str], int, str]] = []
+    dataset_videos = {}
 
     if args.manifest and args.root_dir:
         print("\n  Building FF++ video list (val split only) ...")
         ffpp_videos = build_ffpp_videos(args.manifest, args.root_dir, args.val_ratio)
-        ffpp_videos = _stratified_cap(ffpp_videos, args.max_videos_per_dataset, seed=1)
-        all_videos.extend((v, p, l, "FFPP") for v, p, l in ffpp_videos)
+        dataset_videos["FFPP"] = ffpp_videos
     else:
         print("\n  [skip] FF++: --manifest / --root_dir not provided.")
 
     if args.cdfv2_fake_root and args.cdfv2_real_root:
         print("\n  Building CDFv2 video list ...")
         cdfv2_videos = build_cdfv2_videos(args.cdfv2_fake_root, args.cdfv2_real_root)
-        cdfv2_videos = _stratified_cap(cdfv2_videos, args.max_videos_per_dataset, seed=2)
-        all_videos.extend((v, p, l, "CDFv2") for v, p, l in cdfv2_videos)
+        dataset_videos["CDFv2"] = cdfv2_videos
     else:
         print("\n  [skip] CDFv2: --cdfv2_fake_root / --cdfv2_real_root not provided.")
 
     if args.cdfv3_root and args.cdfv3_csv:
         print("\n  Building CDFv3 video list ...")
         cdfv3_videos = build_cdfv3_videos(args.cdfv3_root, args.cdfv3_csv)
-        cdfv3_videos = _stratified_cap(cdfv3_videos, args.max_videos_per_dataset, seed=3)
-        all_videos.extend((v, p, l, "CDFv3") for v, p, l in cdfv3_videos)
+        dataset_videos["CDFv3"] = cdfv3_videos
     else:
         print("\n  [skip] CDFv3: --cdfv3_root / --cdfv3_csv not provided.")
+
+    all_videos: List[Tuple[str, List[str], int, str]] = _dataset_balanced_items(
+        dataset_videos, args.max_videos_per_dataset
+    )
 
     if not all_videos:
         raise ValueError(
@@ -782,39 +821,49 @@ def main():
         )
         print(f"  Cached raw embeddings -> {args.embeddings_out}")
 
-    # ---- t-SNE ---------------------------------------------------------------
-    from sklearn.manifold import TSNE
+    # ---- UMAP ----------------------------------------------------------------
     from sklearn.preprocessing import StandardScaler
+    try:
+        import umap
+    except ImportError as exc:
+        raise ImportError(
+            "UMAP requires the 'umap-learn' package. Install it with: "
+            "pip install umap-learn"
+        ) from exc
 
-    print("\n  Standardizing embeddings and running joint t-SNE ...")
+    print("\n  Standardizing embeddings and running joint UMAP ...")
     scaled = StandardScaler().fit_transform(embeddings)
 
     n = scaled.shape[0]
-    perplexity = min(args.perplexity, max(5.0, (n - 1) / 3.0))
-    tsne = TSNE(
-        n_components=2, perplexity=perplexity, random_state=args.tsne_seed,
-        init="pca", learning_rate="auto",
+    n_neighbors = min(args.umap_neighbors, max(2, n - 1))
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=n_neighbors,
+        min_dist=args.umap_min_dist,
+        metric=args.umap_metric,
+        random_state=args.umap_seed,
     )
-    coords = tsne.fit_transform(scaled)
+    coords = reducer.fit_transform(scaled)
 
     # ---- Plot ------------------------------------------------------------------
-    plot_tsne(coords, labels, probs, dataset_tags, args.out)
-    print(f"\n  Saved plot -> {args.out}")
+    saved = plot_umap(coords, labels, probs, dataset_tags, args.out)
+    print("\n  Saved plots:")
+    for path in saved:
+        print(f"    {path}")
     print(sep)
 
 
-def plot_tsne(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
+def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
               dataset_tags: List[str], out_path: str):
     import matplotlib.pyplot as plt
 
     dataset_tags = np.array(dataset_tags)
     datasets = [d for d in ["FFPP", "CDFv2", "CDFv3"] if d in set(dataset_tags)]
     dataset_colors = {"FFPP": "#4C72B0", "CDFv2": "#DD8452", "CDFv3": "#55A868"}
+    saved = []
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-
-    # -- Panel 1: colored by dataset, marker by real/fake --------------------
-    ax = axes[0]
+    # -- Main: colored by dataset, marker by real/fake -----------------------
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
     for dset in datasets:
         mask_d = dataset_tags == dset
         for label, marker, name in [(0, "o", "Real"), (1, "^", "Fake")]:
@@ -827,26 +876,107 @@ def plot_tsne(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
                 s=28, alpha=0.7, linewidths=0.3, edgecolors="black",
                 label=f"{dset} - {name}",
             )
-    ax.set_title("t-SNE of video embeddings\ncolor = dataset, shape = real/fake")
-    ax.set_xlabel("t-SNE dim 1")
-    ax.set_ylabel("t-SNE dim 2")
+    ax.set_title("UMAP of video embeddings\ncolor = dataset, shape = real/fake")
+    ax.set_xlabel("UMAP dim 1")
+    ax.set_ylabel("UMAP dim 2")
     ax.legend(fontsize=8, loc="best", markerscale=1.2)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(out_path)
 
-    # -- Panel 2: colored by predicted P(fake) --------------------------------
-    ax2 = axes[1]
-    sc = ax2.scatter(
+    # -- Label-only view ------------------------------------------------------
+    label_path = _output_with_suffix(out_path, "label")
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    label_styles = {
+        0: ("#2E7D32", "o", "Real"),
+        1: ("#C62828", "^", "Fake"),
+    }
+    for label, (color, marker, name) in label_styles.items():
+        mask = labels == label
+        if mask.sum() == 0:
+            continue
+        ax.scatter(
+            coords[mask, 0], coords[mask, 1],
+            c=color, marker=marker, s=30, alpha=0.75,
+            linewidths=0.3, edgecolors="black", label=name,
+        )
+    ax.set_title("UMAP of video embeddings\ncolor = real/fake")
+    ax.set_xlabel("UMAP dim 1")
+    ax.set_ylabel("UMAP dim 2")
+    ax.legend(fontsize=9, loc="best")
+    fig.tight_layout()
+    fig.savefig(label_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(label_path)
+
+    # -- Predicted probability view ------------------------------------------
+    prob_path = _output_with_suffix(out_path, "prob")
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    sc = ax.scatter(
         coords[:, 0], coords[:, 1], c=probs, cmap="coolwarm",
         vmin=0, vmax=1, s=28, alpha=0.8, linewidths=0.3, edgecolors="black",
     )
-    cbar = fig.colorbar(sc, ax=ax2)
+    cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Predicted P(fake)")
-    ax2.set_title("t-SNE of video embeddings\ncolor = model's predicted P(fake)")
-    ax2.set_xlabel("t-SNE dim 1")
-    ax2.set_ylabel("t-SNE dim 2")
-
+    ax.set_title("UMAP of video embeddings\ncolor = model's predicted P(fake)")
+    ax.set_xlabel("UMAP dim 1")
+    ax.set_ylabel("UMAP dim 2")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(prob_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
+    saved.append(prob_path)
+
+    # -- Correctness view -----------------------------------------------------
+    correct_path = _output_with_suffix(out_path, "correctness")
+    preds = (probs >= 0.5).astype(int)
+    correct = preds == labels
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    for mask, color, marker, name in [
+        (correct, "#4C72B0", "o", "Correct"),
+        (~correct, "#D62728", "x", "Wrong"),
+    ]:
+        if mask.sum() == 0:
+            continue
+        ax.scatter(
+            coords[mask, 0], coords[mask, 1],
+            c=color, marker=marker, s=34, alpha=0.8,
+            linewidths=0.7, edgecolors="black" if marker != "x" else color,
+            label=name,
+        )
+    ax.set_title("UMAP of video embeddings\ncolor = prediction correctness")
+    ax.set_xlabel("UMAP dim 1")
+    ax.set_ylabel("UMAP dim 2")
+    ax.legend(fontsize=9, loc="best")
+    fig.tight_layout()
+    fig.savefig(correct_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(correct_path)
+
+    # -- Split real/fake panels ----------------------------------------------
+    split_path = _output_with_suffix(out_path, "real_fake_split")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+    for ax, label, title in [(axes[0], 0, "Real videos"), (axes[1], 1, "Fake videos")]:
+        for dset in datasets:
+            mask = (labels == label) & (dataset_tags == dset)
+            if mask.sum() == 0:
+                continue
+            ax.scatter(
+                coords[mask, 0], coords[mask, 1],
+                c=dataset_colors[dset], s=30, alpha=0.75,
+                linewidths=0.3, edgecolors="black", label=dset,
+            )
+        ax.set_title(title)
+        ax.set_xlabel("UMAP dim 1")
+        ax.set_ylabel("UMAP dim 2")
+        ax.legend(fontsize=8, loc="best")
+    fig.suptitle("UMAP split by class")
+    fig.tight_layout()
+    fig.savefig(split_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(split_path)
+
+    return saved
 
 
 if __name__ == "__main__":
