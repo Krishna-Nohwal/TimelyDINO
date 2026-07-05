@@ -64,19 +64,32 @@ Directory / manifest layout (from the uploaded scripts)
       --cdfv3_root  root such that <cdfv3_root>/<sample_dir>/image.png exists
       video_id = parent directory of sample_dir.
 
-Usage
------
+Full commands
+-------------
+First cache embeddings once:
+
 python tsne_predictions1.py \
-    --checkpoint       /home/tarun/Desktop/best/best.pth \
-    --manifest          /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/manifest_ff_onct.csv \
-    --root_dir         /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/ \
-    --cdfv2_fake_root  /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2\
-    --cdfv2_real_root  /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real\
-    --cdfv3_root       /media/tarun/B482367C823642E2/usr/cdfv3_face_crops \
-    --cdfv3_csv        /media/tarun/B482367C823642E2/usr/cdfv3_face_crops/manifest_cdfv3_face_crops.csv\
-    --num_frames 32 --max_videos_per_dataset 300 \
+    --checkpoint /home/tarun/Desktop/best/best.pth \
+    --manifest /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/manifest_ff_onct.csv \
+    --root_dir /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/ \
+    --cdfv2_fake_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2 \
+    --cdfv2_real_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real \
+    --cdfv3_root /media/tarun/B482367C823642E2/usr/cdfv3_face_crops \
+    --cdfv3_csv /media/tarun/B482367C823642E2/usr/cdfv3_face_crops/manifest_cdfv3_face_crops.csv \
+    --num_frames 32 \
+    --max_videos_per_dataset 300 \
     --train_real_root /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/real \
+    --embeddings_out cached_video_embeddings.npz \
     --out umap_predictions.png
+
+Then reuse cached embeddings for plotting:
+
+python tsne_predictions1.py \
+    --embeddings_npz cached_video_embeddings.npz \
+    --out umap_predictions.png
+
+If --embeddings_out is omitted, embeddings are automatically cached next to the
+figure as <out_stem>_embeddings.npz before UMAP is imported.
 
 Any of --manifest/--root_dir, --cdfv2_fake_root/--cdfv2_real_root,
 --cdfv3_root/--cdfv3_csv may be omitted to skip that dataset.
@@ -84,6 +97,7 @@ Any of --manifest/--root_dir, --cdfv2_fake_root/--cdfv2_real_root,
 
 import argparse
 import math
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -621,8 +635,9 @@ def parse_args():
         description="UMAP of VideoViT video-level embeddings/predictions "
                     "across FF++, CDFv2, and CDFv3."
     )
-    p.add_argument("--checkpoint", required=True,
-                   help="Path to a Stage-2 frame-end VideoViT checkpoint (.pth).")
+    p.add_argument("--checkpoint", default="",
+                   help="Path to a Stage-2 frame-end VideoViT checkpoint (.pth). "
+                        "Not needed if --embeddings_npz is supplied.")
     p.add_argument("--num_frames", type=int, default=32)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=4)
@@ -638,6 +653,10 @@ def parse_args():
     p.add_argument("--embeddings_out", default="",
                    help="Optional .npz path to cache raw embeddings/labels/probs "
                         "(useful to re-plot without rerunning the model).")
+    p.add_argument("--embeddings_npz", default="",
+                   help="Optional cached .npz containing embeddings, labels, probs, "
+                        "video_ids, and dataset_tags. If supplied, model inference "
+                        "and dataset loading are skipped.")
 
     # FF++
     p.add_argument("--manifest", default="",
@@ -721,6 +740,11 @@ def _output_with_suffix(out_path: str, suffix: str) -> str:
     return str(path.with_name(f"{path.stem}_{suffix}{path.suffix}"))
 
 
+def _default_embeddings_path(out_path: str) -> str:
+    path = Path(out_path)
+    return str(path.with_name(f"{path.stem}_embeddings.npz"))
+
+
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -729,106 +753,125 @@ def main():
     sep = "=" * 78
     print(f"\n{sep}\n  UMAP of VideoViT predictions — FF++ / CDFv2 / CDFv3\n{sep}")
     print(f"  Device     : {device}")
-    print(f"  Checkpoint : {args.checkpoint}")
+    if args.embeddings_npz:
+        data = np.load(args.embeddings_npz, allow_pickle=True)
+        embeddings = data["embeddings"]
+        labels = data["labels"].astype(int)
+        probs = data["probs"]
+        video_ids = data["video_ids"].astype(str).tolist()
+        dataset_tags = data["dataset_tags"].astype(str).tolist()
+        print(f"  Loaded cached embeddings: {embeddings.shape} from {args.embeddings_npz}")
+    else:
+        if not args.checkpoint:
+            raise ValueError("Supply --checkpoint or --embeddings_npz.")
+        print(f"  Checkpoint : {args.checkpoint}")
 
-    # ---- Model -------------------------------------------------------------
-    model, use_memory_bank = load_model(args.checkpoint, args.num_frames, device)
+        # ---- Model ---------------------------------------------------------
+        model, use_memory_bank = load_model(args.checkpoint, args.num_frames, device)
 
-    if use_memory_bank:
-        if not args.train_real_root:
-            raise ValueError(
-                "Checkpoint uses a memory bank (use_memory_bank=True); "
-                "please supply --train_real_root."
+        if use_memory_bank:
+            if not args.train_real_root:
+                raise ValueError(
+                    "Checkpoint uses a memory bank (use_memory_bank=True); "
+                    "please supply --train_real_root."
+                )
+            bank = build_memory_bank(
+                model, args.train_real_root, args.num_frames,
+                args.knn_k, args.bank_batch_size, args.num_workers, device,
             )
-        bank = build_memory_bank(
-            model, args.train_real_root, args.num_frames,
-            args.knn_k, args.bank_batch_size, args.num_workers, device,
-        )
-        model.attach_memory_bank(bank)
+            model.attach_memory_bank(bank)
 
-    if not args.no_compile and hasattr(torch, "compile"):
-        print("  Compiling model with torch.compile ...")
-        model = torch.compile(model)
+        if not args.no_compile and hasattr(torch, "compile"):
+            print("  Compiling model with torch.compile ...")
+            model = torch.compile(model)
 
-    # ---- Build video lists per dataset -------------------------------------
-    dataset_videos = {}
+        # ---- Build video lists per dataset ---------------------------------
+        dataset_videos = {}
 
-    if args.manifest and args.root_dir:
-        print("\n  Building FF++ video list (val split only) ...")
-        ffpp_videos = build_ffpp_videos(args.manifest, args.root_dir, args.val_ratio)
-        dataset_videos["FFPP"] = ffpp_videos
-    else:
-        print("\n  [skip] FF++: --manifest / --root_dir not provided.")
+        if args.manifest and args.root_dir:
+            print("\n  Building FF++ video list (val split only) ...")
+            ffpp_videos = build_ffpp_videos(args.manifest, args.root_dir, args.val_ratio)
+            dataset_videos["FFPP"] = ffpp_videos
+        else:
+            print("\n  [skip] FF++: --manifest / --root_dir not provided.")
 
-    if args.cdfv2_fake_root and args.cdfv2_real_root:
-        print("\n  Building CDFv2 video list ...")
-        cdfv2_videos = build_cdfv2_videos(args.cdfv2_fake_root, args.cdfv2_real_root)
-        dataset_videos["CDFv2"] = cdfv2_videos
-    else:
-        print("\n  [skip] CDFv2: --cdfv2_fake_root / --cdfv2_real_root not provided.")
+        if args.cdfv2_fake_root and args.cdfv2_real_root:
+            print("\n  Building CDFv2 video list ...")
+            cdfv2_videos = build_cdfv2_videos(args.cdfv2_fake_root, args.cdfv2_real_root)
+            dataset_videos["CDFv2"] = cdfv2_videos
+        else:
+            print("\n  [skip] CDFv2: --cdfv2_fake_root / --cdfv2_real_root not provided.")
 
-    if args.cdfv3_root and args.cdfv3_csv:
-        print("\n  Building CDFv3 video list ...")
-        cdfv3_videos = build_cdfv3_videos(args.cdfv3_root, args.cdfv3_csv)
-        dataset_videos["CDFv3"] = cdfv3_videos
-    else:
-        print("\n  [skip] CDFv3: --cdfv3_root / --cdfv3_csv not provided.")
+        if args.cdfv3_root and args.cdfv3_csv:
+            print("\n  Building CDFv3 video list ...")
+            cdfv3_videos = build_cdfv3_videos(args.cdfv3_root, args.cdfv3_csv)
+            dataset_videos["CDFv3"] = cdfv3_videos
+        else:
+            print("\n  [skip] CDFv3: --cdfv3_root / --cdfv3_csv not provided.")
 
-    all_videos: List[Tuple[str, List[str], int, str]] = _dataset_balanced_items(
-        dataset_videos, args.max_videos_per_dataset
-    )
-
-    if not all_videos:
-        raise ValueError(
-            "No datasets were provided. Supply at least one of: "
-            "(--manifest & --root_dir), (--cdfv2_fake_root & --cdfv2_real_root), "
-            "(--cdfv3_root & --cdfv3_csv)."
+        all_videos: List[Tuple[str, List[str], int, str]] = _dataset_balanced_items(
+            dataset_videos, args.max_videos_per_dataset
         )
 
-    print(f"\n  Total videos across all datasets: {len(all_videos)}")
+        if not all_videos:
+            raise ValueError(
+                "No datasets were provided. Supply at least one of: "
+                "(--manifest & --root_dir), (--cdfv2_fake_root & --cdfv2_real_root), "
+                "(--cdfv3_root & --cdfv3_csv)."
+            )
 
-    # ---- Dataset / loader ----------------------------------------------------
-    class _CombinedDataset(Dataset):
-        def __init__(self, items):
-            self.items = items
-            self.num_frames = args.num_frames
+        print(f"\n  Total videos across all datasets: {len(all_videos)}")
 
-        def __len__(self):
-            return len(self.items)
+        # ---- Dataset / loader ----------------------------------------------
+        class _CombinedDataset(Dataset):
+            def __init__(self, items):
+                self.items = items
+                self.num_frames = args.num_frames
 
-        def __getitem__(self, idx):
-            vid, paths, label, dset = self.items[idx]
-            indices = _sample_frame_indices(len(paths), self.num_frames)
-            frames = _load_frames([paths[i] for i in indices])
-            return frames, label, vid, dset
+            def __len__(self):
+                return len(self.items)
 
-    combined_dataset = _CombinedDataset(all_videos)
-    loader = DataLoader(
-        combined_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True, collate_fn=clip_collate_fn,
-    )
+            def __getitem__(self, idx):
+                vid, paths, label, dset = self.items[idx]
+                indices = _sample_frame_indices(len(paths), self.num_frames)
+                frames = _load_frames([paths[i] for i in indices])
+                return frames, label, vid, dset
 
-    # ---- Run model, extract embeddings --------------------------------------
-    print("\n  Running VideoViT forward passes to extract embeddings ...")
-    embeddings, labels, probs, video_ids, dataset_tags = extract_embeddings(model, loader, device)
-    print(f"  Extracted embeddings: {embeddings.shape}")
+        combined_dataset = _CombinedDataset(all_videos)
+        loader = DataLoader(
+            combined_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True, collate_fn=clip_collate_fn,
+        )
 
-    if args.embeddings_out:
+        # ---- Run model, extract embeddings ---------------------------------
+        print("\n  Running VideoViT forward passes to extract embeddings ...")
+        embeddings, labels, probs, video_ids, dataset_tags = extract_embeddings(model, loader, device)
+        print(f"  Extracted embeddings: {embeddings.shape}")
+
+        embeddings_out = args.embeddings_out or _default_embeddings_path(args.out)
         np.savez(
-            args.embeddings_out,
+            embeddings_out,
             embeddings=embeddings, labels=labels, probs=probs,
             video_ids=np.array(video_ids), dataset_tags=np.array(dataset_tags),
         )
-        print(f"  Cached raw embeddings -> {args.embeddings_out}")
+        print(f"  Cached raw embeddings -> {embeddings_out}")
 
     # ---- UMAP ----------------------------------------------------------------
     from sklearn.preprocessing import StandardScaler
+    os.environ.setdefault("NUMBA_DISABLE_COVERAGE", "1")
     try:
         import umap
     except ImportError as exc:
         raise ImportError(
             "UMAP requires the 'umap-learn' package. Install it with: "
             "pip install umap-learn"
+        ) from exc
+    except AttributeError as exc:
+        raise RuntimeError(
+            "UMAP import failed inside numba/coverage. The embeddings have already "
+            "been cached, so rerun plotting with --embeddings_npz <cache>. If this "
+            "persists, fix the environment with one of: "
+            "pip install -U numba coverage umap-learn, or pip uninstall coverage."
         ) from exc
 
     print("\n  Standardizing embeddings and running joint UMAP ...")
