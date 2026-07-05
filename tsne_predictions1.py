@@ -78,6 +78,8 @@ python tsne_predictions1.py \
     --uadfv_real_root /media/tarun/B482367C823642E2/usr/uadfv_faces/real \
     --num_frames 32 \
     --max_videos_per_dataset 0 \
+    --outlier_std 2.0 \
+    --outlier_group class \
     --train_real_root /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/real \
     --embeddings_out cached_video_embeddings_ffpp_cdfv2_wdf_uadfv_df0.npz \
     --out umap_ffpp_cdfv2_wdf_uadfv_df0.png
@@ -698,6 +700,13 @@ def parse_args():
                         "and dataset loading are skipped.")
     p.add_argument("--force_extract", action="store_true",
                    help="Recompute embeddings even if --embeddings_out already exists.")
+    p.add_argument("--outlier_std", type=float, default=2.0,
+                   help="Remove embedding outliers farther than mean + N*std "
+                        "within each outlier group. Default 2.0 is stronger. "
+                        "Set <= 0 to disable.")
+    p.add_argument("--outlier_group", default="class",
+                   choices=["class", "dataset_class", "dataset", "all"],
+                   help="Grouping used to compute outlier thresholds.")
 
     # FF++
     p.add_argument("--manifest", default="",
@@ -808,6 +817,79 @@ def _load_cached_embeddings(path: str):
     dataset_tags = data["dataset_tags"].astype(str).tolist()
     print(f"  Loaded cached embeddings: {embeddings.shape} from {path}")
     return embeddings, labels, probs, video_ids, dataset_tags
+
+
+def _print_dataset_counts(title: str, labels: np.ndarray, dataset_tags: List[str]):
+    tags = np.asarray(dataset_tags)
+    print(f"\n  {title}")
+    print("    dataset      total   real   fake")
+    print("    -------------------------------")
+    for dset in sorted(set(tags.tolist())):
+        mask = tags == dset
+        real_n = int(((labels == 0) & mask).sum())
+        fake_n = int(((labels == 1) & mask).sum())
+        print(f"    {dset:<10} {int(mask.sum()):>5} {real_n:>6} {fake_n:>6}")
+    print(f"    {'TOTAL':<10} {len(labels):>5} {int((labels == 0).sum()):>6} {int((labels == 1).sum()):>6}")
+
+
+def _outlier_group_keys(labels: np.ndarray, dataset_tags: List[str], mode: str):
+    tags = np.asarray(dataset_tags)
+    if mode == "class":
+        return np.asarray([f"label={label}" for label in labels])
+    if mode == "dataset":
+        return tags.astype(str)
+    if mode == "dataset_class":
+        return np.asarray([f"{dset}/label={label}" for dset, label in zip(tags, labels)])
+    return np.asarray(["all"] * len(labels))
+
+
+def _remove_embedding_outliers(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    probs: np.ndarray,
+    video_ids: List[str],
+    dataset_tags: List[str],
+    std_factor: float,
+    group_mode: str,
+):
+    if std_factor <= 0:
+        print("\n  Outlier removal disabled (--outlier_std <= 0).")
+        return embeddings, labels, probs, video_ids, dataset_tags
+
+    keys = _outlier_group_keys(labels, dataset_tags, group_mode)
+    keep = np.ones(len(labels), dtype=bool)
+
+    print(f"\n  Outlier removal: group={group_mode}, threshold=mean+{std_factor:.2f}*std")
+    for key in sorted(set(keys.tolist())):
+        idx = np.where(keys == key)[0]
+        if len(idx) < 4:
+            print(f"    {key:<20} n={len(idx):>5}  removed=0  (too small)")
+            continue
+        group_emb = embeddings[idx].astype(np.float64)
+        centroid = group_emb.mean(axis=0, keepdims=True)
+        distances = np.linalg.norm(group_emb - centroid, axis=1)
+        threshold = distances.mean() + std_factor * distances.std()
+        group_keep = distances <= threshold
+        keep[idx] = group_keep
+        print(
+            f"    {key:<20} n={len(idx):>5}  removed={int((~group_keep).sum()):>4}  "
+            f"thr={threshold:.4f}"
+        )
+
+    removed = int((~keep).sum())
+    print(f"  Total outliers removed: {removed}/{len(labels)}")
+    if removed == 0:
+        return embeddings, labels, probs, video_ids, dataset_tags
+
+    filtered_video_ids = [vid for vid, is_keep in zip(video_ids, keep) if is_keep]
+    filtered_dataset_tags = [tag for tag, is_keep in zip(dataset_tags, keep) if is_keep]
+    return (
+        embeddings[keep],
+        labels[keep],
+        probs[keep],
+        filtered_video_ids,
+        filtered_dataset_tags,
+    )
 
 
 def _patch_coverage_for_numba():
@@ -955,6 +1037,18 @@ def main():
             video_ids=np.array(video_ids), dataset_tags=np.array(dataset_tags),
         )
         print(f"  Cached raw embeddings -> {embeddings_out}")
+
+    _print_dataset_counts("Videos loaded before outlier removal:", labels, dataset_tags)
+    embeddings, labels, probs, video_ids, dataset_tags = _remove_embedding_outliers(
+        embeddings,
+        labels,
+        probs,
+        video_ids,
+        dataset_tags,
+        args.outlier_std,
+        args.outlier_group,
+    )
+    _print_dataset_counts("Videos used for UMAP after outlier removal:", labels, dataset_tags)
 
     # ---- UMAP ----------------------------------------------------------------
     from sklearn.preprocessing import StandardScaler
