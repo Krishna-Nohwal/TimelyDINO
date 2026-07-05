@@ -1,11 +1,10 @@
 """
 tsne_predictions.py — UMAP visualization of VideoViT video-level embeddings
-                       and predictions across FF++, CDFv2, DFo, WDF, UADFV,
-                       and optional CDF++.
+                       and predictions across FF++, CDFv2, WDF, UADFV, and DFo.
 
 What this visualizes
 ---------------------
-For every video in the three evaluation sets, this script runs the FULL
+For every video in the selected evaluation datasets, this script runs the FULL
 Stage-2 VideoViT forward pass (frame_model -> temporal transformers ->
 fusion_classifier) and extracts:
 
@@ -17,32 +16,28 @@ fusion_classifier) and extracts:
   * video_prob         : P(fake) from the frame-end video classifier (stream C
                           in the eval scripts — "frame-end w/ mem" style path).
   * video_label        : ground truth (0 = Real, 1 = Fake).
-  * dataset            : 'FFPP' | 'CDFv2' | 'DFo' | 'WDF' | 'UADFV' | optional
-                          'CDFv3'.
+  * dataset            : 'FFPP' | 'CDFv2' | 'WDF' | 'UADFV' | 'DFo'.
 
 All embeddings across the datasets are sampled with the same number of videos
 per dataset, stacked, jointly reduced to 2D with a single UMAP fit (so the
 datasets sit in one shared space), and plotted in several paper-friendly views:
 dataset+label, label-only, predicted P(fake), correctness, and real/fake split.
 
-Model / architecture notes (see video_model.py, train_stage2_frame_end.py,
-cdfv2_knn42.py, cdfv3_knn42.py)
-------------------------------------------------------------------------
+Model / architecture notes (see video_model.py and train_stage2_frame_end.py)
+----------------------------------------------------------------------------
   - Backbone: frame_model.ViT (frame_model_4layers), ViT-Large, EMBED_DIM=1024,
     taps 4 transformer layers [20,21,22,23]; forward() -> 3-tuple
     (logits_list, features_list, cls_list). cls_list[i] is (B*T, 1024), the
     already-squeezed CLS token ("f_cls") for tapped layer i.
-  - VideoViT (frame-end variant, matches train_stage2_frame_end.py /
-    cdfv2_knn42.py / cdfv3_knn42.py):
+  - VideoViT (frame-end variant, matches train_stage2_frame_end.py):
         temporal_transformers : 4 x TemporalTransformer, one per tapped layer
         fusion_classifier      : Linear(4*1024 + 2, 2)
             input = concat(temporal_vec [4096], frame_mean_logits [2])
             frame_mean_logits = deepest SpatialHead (index 3) logits, averaged
             over valid frames -- a "shortcut" appended at the very end.
   - use_memory_bank (optional real-video kNN gate) is auto-detected from the
-    checkpoint the same way cdfv2_knn42.py / cdfv3_knn42.py do it: presence of
-    a 'memory_gate' key => True, and the memory bank must be rebuilt from real
-    training frames (frame_model is frozen so embeddings are deterministic).
+    checkpoint by checking for the 'memory_gate' key; the memory bank must be
+    rebuilt from real training frames because the frame model is frozen.
 
 Directory / manifest layout (from the uploaded scripts)
 ---------------------------------------------------------
@@ -58,13 +53,12 @@ Directory / manifest layout (from the uploaded scripts)
       --real_root  <real_root>/<sample_dir>/image.png   (label=0, real)
       sample_dir encodes video via trailing _fNNNN or _frame_NN suffix.
 
-  CDFv3 (cdfv3_knn42.py):
-      --cdfv3_csv   manifest CSV, columns {sample_dir, label, ...}
-                    (label: 1=Real, 0=Fake in the manifest -- inverted vs.
-                    the standard convention; this script remaps to 0=Real/
-                    1=Fake internally, exactly like cdfv3_knn42.py does)
-      --cdfv3_root  root such that <cdfv3_root>/<sample_dir>/image.png exists
-      video_id = parent directory of sample_dir.
+  DFo / UADFV:
+      --df0_fake_root / --uadfv_fake_root  <root>/<video_id>/<frame_idx>/image.png
+      --df0_real_root / --uadfv_real_root  <root>/<video_id>/<frame_idx>/image.png
+
+  WDF:
+      --wdf_fake_root / --wdf_real_root  <root>/<video_id>_<frame_number>.png
 
 Full commands
 -------------
@@ -76,8 +70,8 @@ python tsne_predictions1.py \
     --root_dir /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/ \
     --cdfv2_fake_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2 \
     --cdfv2_real_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real \
-    --dfo_fake_root /media/tarun/B482367C823642E2/usr/df1.0_faces/fake \
-    --dfo_real_root /media/tarun/B482367C823642E2/usr/df1.0_faces/real \
+    --df0_fake_root /media/tarun/B482367C823642E2/usr/df1.0_faces/fake \
+    --df0_real_root /media/tarun/B482367C823642E2/usr/df1.0_faces/real \
     --wdf_fake_root /media/tarun/B482367C823642E2/usr/wdf/test/fake \
     --wdf_real_root /media/tarun/B482367C823642E2/usr/wdf/test/real \
     --uadfv_fake_root /media/tarun/B482367C823642E2/usr/uadfv_faces/fake \
@@ -85,14 +79,14 @@ python tsne_predictions1.py \
     --num_frames 32 \
     --max_videos_per_dataset 0 \
     --train_real_root /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/real \
-    --embeddings_out cached_video_embeddings.npz \
-    --out umap_predictions.png
+    --embeddings_out cached_video_embeddings_ffpp_cdfv2_wdf_uadfv_df0.npz \
+    --out umap_ffpp_cdfv2_wdf_uadfv_df0.png
 
 Then reuse cached embeddings for plotting:
 
 python tsne_predictions1.py \
-    --embeddings_npz cached_video_embeddings.npz \
-    --out umap_predictions.png
+    --embeddings_npz cached_video_embeddings_ffpp_cdfv2_wdf_uadfv_df0.npz \
+    --out umap_ffpp_cdfv2_wdf_uadfv_df0.png
 
 If --embeddings_out is omitted, embeddings are automatically cached next to the
 figure as <out_stem>_embeddings.npz before UMAP is imported.
@@ -100,9 +94,8 @@ If --embeddings_out points to an existing file, that cache is reused unless
 --force_extract is supplied.
 
 Any of --manifest/--root_dir, --cdfv2_fake_root/--cdfv2_real_root,
---dfo_fake_root/--dfo_real_root, --wdf_fake_root/--wdf_real_root,
---uadfv_fake_root/--uadfv_real_root, or --cdfv3_root/--cdfv3_csv may be
-omitted to skip that dataset.
+--df0_fake_root/--df0_real_root, --wdf_fake_root/--wdf_real_root, or
+--uadfv_fake_root/--uadfv_real_root may be omitted to skip that dataset.
 """
 
 import argparse
@@ -127,9 +120,8 @@ from video_model import RealVideoMemoryBank, TemporalTransformer
 
 
 # ---------------------------------------------------------------------------
-# VideoViT (frame-end variant) — identical architecture to cdfv2_knn42.py /
-# cdfv3_knn42.py / train_stage2_frame_end.py so a Stage-2 checkpoint loads
-# with strict=True.
+# VideoViT (frame-end variant) -- identical architecture to
+# train_stage2_frame_end.py so a Stage-2 checkpoint loads with strict=True.
 # ---------------------------------------------------------------------------
 
 class VideoViT(nn.Module):
@@ -254,7 +246,7 @@ class VideoViT(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint loading (mirrors cdfv2_knn42.py / cdfv3_knn42.py load_model())
+# Checkpoint loading
 # ---------------------------------------------------------------------------
 
 def load_model(checkpoint_path: str, num_frames: int, device: torch.device):
@@ -284,8 +276,7 @@ def load_model(checkpoint_path: str, num_frames: int, device: torch.device):
     # The memory bank (if used) gates CLS token sequences before the temporal
     # transformers; it adds a 'memory_gate' parameter but does NOT change
     # fusion_classifier's input dimensionality. So detect use_memory_bank from
-    # key presence, not from the fusion layer's shape (matches cdfv2_knn42.py /
-    # cdfv3_knn42.py / train_stage2_frame_end.py behavior).
+    # key presence, not from the fusion layer's shape.
     use_memory_bank = "memory_gate" in ckpt
     print(f"  fusion_classifier input dim={fusion_in_dim}  "
           f"memory_gate present={use_memory_bank} -> use_memory_bank={use_memory_bank}")
@@ -540,47 +531,6 @@ def build_wdf_videos(fake_root: str, real_root: str) -> List[Tuple[str, List[str
     return videos
 
 
-def _video_id_from_sample_dir_cdfv3(sample_dir: str) -> str:
-    """CDFv3: video_id is the parent directory of the per-frame sample_dir."""
-    return Path(sample_dir).parent.name
-
-
-def build_cdfv3_videos(cdfv3_root: str, cdfv3_csv: str) -> List[Tuple[str, List[str], int]]:
-    df = pd.read_csv(cdfv3_csv, sep=None, engine="python")
-    required = {"sample_dir", "label"}
-    if not required.issubset(df.columns):
-        raise ValueError(f"CDFv3 manifest must contain {required}. Found: {list(df.columns)}")
-
-    df["label"] = df["label"].astype(int)
-    df["video_id"] = df["sample_dir"].apply(_video_id_from_sample_dir_cdfv3)
-
-    root = Path(cdfv3_root)
-    vid2paths: dict = defaultdict(list)
-    vid2label: dict = {}
-
-    for video_id, group in df.groupby("video_id"):
-        # Manifest convention: label=1 -> Real, label=0 -> Fake.
-        # Remap to standard 0=Real, 1=Fake to match CDFv2 / FF++.
-        manifest_label = int(group["label"].iloc[0])
-        label = 0 if manifest_label == 1 else 1
-
-        paths = []
-        for rel in group["sample_dir"].astype(str):
-            img_path = root / rel / "image.png"
-            if img_path.is_file():
-                paths.append(str(img_path))
-        if paths:
-            vid2paths[video_id] = sorted(paths)
-            vid2label[video_id] = label
-
-    videos = [(vid, paths, vid2label[vid]) for vid, paths in sorted(vid2paths.items())]
-
-    real_n = sum(1 for _, _, l in videos if l == 0)
-    fake_n = sum(1 for _, _, l in videos if l == 1)
-    print(f"  [CDFv3] {len(videos)} videos  (real={real_n}, fake={fake_n})")
-    return videos
-
-
 # ---------------------------------------------------------------------------
 # Real-video memory bank rebuild (only needed if checkpoint used it)
 # ---------------------------------------------------------------------------
@@ -721,7 +671,7 @@ def extract_embeddings(
 def parse_args():
     p = argparse.ArgumentParser(
         description="UMAP of VideoViT video-level embeddings/predictions "
-                    "across FF++, CDFv2, DFo, WDF, UADFV, and optional CDF++."
+                    "across FF++, CDFv2, WDF, UADFV, and DFo."
     )
     p.add_argument("--checkpoint", default="",
                    help="Path to a Stage-2 frame-end VideoViT checkpoint (.pth). "
@@ -761,9 +711,10 @@ def parse_args():
     p.add_argument("--cdfv2_fake_root", default="")
     p.add_argument("--cdfv2_real_root", default="")
 
-    # DFo / DeeperForensics-1.0 style nested roots
-    p.add_argument("--dfo_fake_root", default="")
-    p.add_argument("--dfo_real_root", default="")
+    # DFo / DeeperForensics-1.0 style nested roots. df0 aliases are accepted
+    # because the dataset is often typed that way in local notes.
+    p.add_argument("--df0_fake_root", default="")
+    p.add_argument("--df0_real_root", default="")
 
     # WDF flat roots
     p.add_argument("--wdf_fake_root", default="")
@@ -772,10 +723,6 @@ def parse_args():
     # UADFV style nested roots
     p.add_argument("--uadfv_fake_root", default="")
     p.add_argument("--uadfv_real_root", default="")
-
-    # CDFv3 / CDF++ optional
-    p.add_argument("--cdfv3_root", default="")
-    p.add_argument("--cdfv3_csv", default="")
 
     # Memory bank (only needed if checkpoint has one)
     p.add_argument("--train_real_root", default="",
@@ -937,13 +884,13 @@ def main():
         else:
             print("\n  [skip] CDFv2: --cdfv2_fake_root / --cdfv2_real_root not provided.")
 
-        if args.dfo_fake_root and args.dfo_real_root:
+        if args.df0_fake_root and args.df0_real_root:
             print("\n  Building DFo video list ...")
             dataset_videos["DFo"] = build_nested_image_videos(
-                args.dfo_fake_root, args.dfo_real_root, "DFo"
+                args.df0_fake_root, args.df0_real_root, "DFo"
             )
         else:
-            print("\n  [skip] DFo: --dfo_fake_root / --dfo_real_root not provided.")
+            print("\n  [skip] DFo: --df0_fake_root / --df0_real_root not provided.")
 
         if args.wdf_fake_root and args.wdf_real_root:
             print("\n  Building WDF video list ...")
@@ -960,12 +907,6 @@ def main():
             )
         else:
             print("\n  [skip] UADFV: --uadfv_fake_root / --uadfv_real_root not provided.")
-
-        if args.cdfv3_root and args.cdfv3_csv:
-            print("\n  Building CDFv3/CDF++ video list ...")
-            dataset_videos["CDFv3"] = build_cdfv3_videos(args.cdfv3_root, args.cdfv3_csv)
-        else:
-            print("\n  [skip] CDFv3/CDF++: --cdfv3_root / --cdfv3_csv not provided.")
 
         all_videos: List[Tuple[str, List[str], int, str]] = _dataset_balanced_items(
             dataset_videos, args.max_videos_per_dataset
@@ -1058,7 +999,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
     import matplotlib.pyplot as plt
 
     dataset_tags = np.array(dataset_tags)
-    preferred_order = ["FFPP", "CDFv2", "DFo", "WDF", "UADFV", "CDFv3"]
+    preferred_order = ["FFPP", "CDFv2", "WDF", "UADFV", "DFo"]
     present = set(dataset_tags.tolist())
     datasets = [d for d in preferred_order if d in present]
     datasets.extend(sorted(present - set(datasets)))
@@ -1068,7 +1009,6 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
         "DFo": "#55A868",
         "WDF": "#C44E52",
         "UADFV": "#8172B3",
-        "CDFv3": "#937860",
     }
     fallback_colors = plt.get_cmap("tab20").colors
     dataset_colors = {
