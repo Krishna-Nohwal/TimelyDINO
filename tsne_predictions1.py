@@ -1,6 +1,7 @@
 """
 tsne_predictions.py — UMAP visualization of VideoViT video-level embeddings
-                       and predictions across FF++ (val split), CDFv2, CDFv3.
+                       and predictions across FF++, CDFv2, DFo, WDF, UADFV,
+                       and optional CDF++.
 
 What this visualizes
 ---------------------
@@ -16,7 +17,8 @@ fusion_classifier) and extracts:
   * video_prob         : P(fake) from the frame-end video classifier (stream C
                           in the eval scripts — "frame-end w/ mem" style path).
   * video_label        : ground truth (0 = Real, 1 = Fake).
-  * dataset            : 'FFPP' | 'CDFv2' | 'CDFv3'.
+  * dataset            : 'FFPP' | 'CDFv2' | 'DFo' | 'WDF' | 'UADFV' | optional
+                          'CDFv3'.
 
 All embeddings across the datasets are sampled with the same number of videos
 per dataset, stacked, jointly reduced to 2D with a single UMAP fit (so the
@@ -74,10 +76,14 @@ python tsne_predictions1.py \
     --root_dir /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/ \
     --cdfv2_fake_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2 \
     --cdfv2_real_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real \
-    --cdfv3_root /media/tarun/B482367C823642E2/usr/cdfv3_face_crops \
-    --cdfv3_csv /media/tarun/B482367C823642E2/usr/cdfv3_face_crops/manifest_cdfv3_face_crops.csv \
+    --dfo_fake_root /media/tarun/B482367C823642E2/usr/df1.0_faces/fake \
+    --dfo_real_root /media/tarun/B482367C823642E2/usr/df1.0_faces/real \
+    --wdf_fake_root /media/tarun/B482367C823642E2/usr/wdf/test/fake \
+    --wdf_real_root /media/tarun/B482367C823642E2/usr/wdf/test/real \
+    --uadfv_fake_root /media/tarun/B482367C823642E2/usr/uadfv_faces/fake \
+    --uadfv_real_root /media/tarun/B482367C823642E2/usr/uadfv_faces/real \
     --num_frames 32 \
-    --max_videos_per_dataset 300 \
+    --max_videos_per_dataset 0 \
     --train_real_root /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/real \
     --embeddings_out cached_video_embeddings.npz \
     --out umap_predictions.png
@@ -94,7 +100,9 @@ If --embeddings_out points to an existing file, that cache is reused unless
 --force_extract is supplied.
 
 Any of --manifest/--root_dir, --cdfv2_fake_root/--cdfv2_real_root,
---cdfv3_root/--cdfv3_csv may be omitted to skip that dataset.
+--dfo_fake_root/--dfo_real_root, --wdf_fake_root/--wdf_real_root,
+--uadfv_fake_root/--uadfv_real_root, or --cdfv3_root/--cdfv3_csv may be
+omitted to skip that dataset.
 """
 
 import argparse
@@ -454,6 +462,84 @@ def build_cdfv2_videos(fake_root: str, real_root: str) -> List[Tuple[str, List[s
     return videos
 
 
+def _sort_nested_frame_paths(paths: List[Path]) -> List[str]:
+    def key_fn(path: Path):
+        parent = path.parent.name
+        if parent.isdigit():
+            return int(parent), str(path)
+        return 10**12, str(path)
+
+    return [str(path) for path in sorted(paths, key=key_fn)]
+
+
+def build_nested_image_videos(
+    fake_root: str,
+    real_root: str,
+    dataset_name: str,
+) -> List[Tuple[str, List[str], int]]:
+    """
+    Builds videos for DFo/UADFV style directories:
+        <fake_root>/<video_id>/<frame_idx>/image.png
+        <real_root>/<video_id>/<frame_idx>/image.png
+    """
+    videos = []
+    for root_str, label in [(fake_root, 1), (real_root, 0)]:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"  [{dataset_name}] WARNING: {root} does not exist, skipping.")
+            continue
+        for video_dir in sorted(d for d in root.iterdir() if d.is_dir()):
+            paths = _sort_nested_frame_paths(list(video_dir.rglob("image.png")))
+            if paths:
+                videos.append((video_dir.name, paths, label))
+
+    real_n = sum(1 for _, _, l in videos if l == 0)
+    fake_n = sum(1 for _, _, l in videos if l == 1)
+    print(f"  [{dataset_name}] {len(videos)} videos  (real={real_n}, fake={fake_n})")
+    return videos
+
+
+_FLAT_FRAME_RE = re.compile(r"^(.+)_(\d+)\.(png|jpg|jpeg)$", re.IGNORECASE)
+
+
+def build_wdf_videos(fake_root: str, real_root: str) -> List[Tuple[str, List[str], int]]:
+    """
+    Builds videos for WDF's flat layout:
+        <root>/<video_id>_<frame_number>.png
+    """
+    videos = []
+    for root_str, label in [(fake_root, 1), (real_root, 0)]:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"  [WDF] WARNING: {root} does not exist, skipping.")
+            continue
+
+        grouped = defaultdict(list)
+        skipped = 0
+        for path in sorted(root.iterdir()):
+            if not path.is_file():
+                continue
+            match = _FLAT_FRAME_RE.match(path.name)
+            if not match:
+                skipped += 1
+                continue
+            video_id, frame_idx = match.group(1), int(match.group(2))
+            grouped[video_id].append((frame_idx, str(path)))
+
+        if skipped:
+            print(f"  [WDF] skipped {skipped} files under {root}")
+
+        for video_id, indexed_paths in sorted(grouped.items()):
+            paths = [p for _, p in sorted(indexed_paths)]
+            if paths:
+                videos.append((video_id, paths, label))
+
+    real_n = sum(1 for _, _, l in videos if l == 0)
+    fake_n = sum(1 for _, _, l in videos if l == 1)
+    print(f"  [WDF] {len(videos)} videos  (real={real_n}, fake={fake_n})")
+    return videos
+
+
 def _video_id_from_sample_dir_cdfv3(sample_dir: str) -> str:
     """CDFv3: video_id is the parent directory of the per-frame sample_dir."""
     return Path(sample_dir).parent.name
@@ -635,7 +721,7 @@ def extract_embeddings(
 def parse_args():
     p = argparse.ArgumentParser(
         description="UMAP of VideoViT video-level embeddings/predictions "
-                    "across FF++, CDFv2, and CDFv3."
+                    "across FF++, CDFv2, DFo, WDF, UADFV, and optional CDF++."
     )
     p.add_argument("--checkpoint", default="",
                    help="Path to a Stage-2 frame-end VideoViT checkpoint (.pth). "
@@ -675,7 +761,19 @@ def parse_args():
     p.add_argument("--cdfv2_fake_root", default="")
     p.add_argument("--cdfv2_real_root", default="")
 
-    # CDFv3
+    # DFo / DeeperForensics-1.0 style nested roots
+    p.add_argument("--dfo_fake_root", default="")
+    p.add_argument("--dfo_real_root", default="")
+
+    # WDF flat roots
+    p.add_argument("--wdf_fake_root", default="")
+    p.add_argument("--wdf_real_root", default="")
+
+    # UADFV style nested roots
+    p.add_argument("--uadfv_fake_root", default="")
+    p.add_argument("--uadfv_real_root", default="")
+
+    # CDFv3 / CDF++ optional
     p.add_argument("--cdfv3_root", default="")
     p.add_argument("--cdfv3_csv", default="")
 
@@ -687,8 +785,8 @@ def parse_args():
     p.add_argument("--bank_batch_size", type=int, default=16)
 
     # UMAP params
-    p.add_argument("--umap_neighbors", type=int, default=30)
-    p.add_argument("--umap_min_dist", type=float, default=0.15)
+    p.add_argument("--umap_neighbors", type=int, default=50)
+    p.add_argument("--umap_min_dist", type=float, default=0.02)
     p.add_argument("--umap_metric", default="cosine")
     p.add_argument("--umap_seed", type=int, default=42)
 
@@ -786,7 +884,7 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     sep = "=" * 78
-    print(f"\n{sep}\n  UMAP of VideoViT predictions — FF++ / CDFv2 / CDFv3\n{sep}")
+    print(f"\n{sep}\n  UMAP of VideoViT predictions — cross-dataset video embeddings\n{sep}")
     print(f"  Device     : {device}")
     if args.embeddings_npz:
         embeddings, labels, probs, video_ids, dataset_tags = _load_cached_embeddings(
@@ -825,24 +923,49 @@ def main():
 
         if args.manifest and args.root_dir:
             print("\n  Building FF++ video list (val split only) ...")
-            ffpp_videos = build_ffpp_videos(args.manifest, args.root_dir, args.val_ratio)
-            dataset_videos["FFPP"] = ffpp_videos
+            dataset_videos["FFPP"] = build_ffpp_videos(
+                args.manifest, args.root_dir, args.val_ratio
+            )
         else:
             print("\n  [skip] FF++: --manifest / --root_dir not provided.")
 
         if args.cdfv2_fake_root and args.cdfv2_real_root:
             print("\n  Building CDFv2 video list ...")
-            cdfv2_videos = build_cdfv2_videos(args.cdfv2_fake_root, args.cdfv2_real_root)
-            dataset_videos["CDFv2"] = cdfv2_videos
+            dataset_videos["CDFv2"] = build_cdfv2_videos(
+                args.cdfv2_fake_root, args.cdfv2_real_root
+            )
         else:
             print("\n  [skip] CDFv2: --cdfv2_fake_root / --cdfv2_real_root not provided.")
 
-        if args.cdfv3_root and args.cdfv3_csv:
-            print("\n  Building CDFv3 video list ...")
-            cdfv3_videos = build_cdfv3_videos(args.cdfv3_root, args.cdfv3_csv)
-            dataset_videos["CDFv3"] = cdfv3_videos
+        if args.dfo_fake_root and args.dfo_real_root:
+            print("\n  Building DFo video list ...")
+            dataset_videos["DFo"] = build_nested_image_videos(
+                args.dfo_fake_root, args.dfo_real_root, "DFo"
+            )
         else:
-            print("\n  [skip] CDFv3: --cdfv3_root / --cdfv3_csv not provided.")
+            print("\n  [skip] DFo: --dfo_fake_root / --dfo_real_root not provided.")
+
+        if args.wdf_fake_root and args.wdf_real_root:
+            print("\n  Building WDF video list ...")
+            dataset_videos["WDF"] = build_wdf_videos(
+                args.wdf_fake_root, args.wdf_real_root
+            )
+        else:
+            print("\n  [skip] WDF: --wdf_fake_root / --wdf_real_root not provided.")
+
+        if args.uadfv_fake_root and args.uadfv_real_root:
+            print("\n  Building UADFV video list ...")
+            dataset_videos["UADFV"] = build_nested_image_videos(
+                args.uadfv_fake_root, args.uadfv_real_root, "UADFV"
+            )
+        else:
+            print("\n  [skip] UADFV: --uadfv_fake_root / --uadfv_real_root not provided.")
+
+        if args.cdfv3_root and args.cdfv3_csv:
+            print("\n  Building CDFv3/CDF++ video list ...")
+            dataset_videos["CDFv3"] = build_cdfv3_videos(args.cdfv3_root, args.cdfv3_csv)
+        else:
+            print("\n  [skip] CDFv3/CDF++: --cdfv3_root / --cdfv3_csv not provided.")
 
         all_videos: List[Tuple[str, List[str], int, str]] = _dataset_balanced_items(
             dataset_videos, args.max_videos_per_dataset
@@ -850,9 +973,7 @@ def main():
 
         if not all_videos:
             raise ValueError(
-                "No datasets were provided. Supply at least one of: "
-                "(--manifest & --root_dir), (--cdfv2_fake_root & --cdfv2_real_root), "
-                "(--cdfv3_root & --cdfv3_csv)."
+                "No datasets were provided. Supply at least one dataset root/manifest pair."
             )
 
         print(f"\n  Total videos across all datasets: {len(all_videos)}")
@@ -937,8 +1058,23 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
     import matplotlib.pyplot as plt
 
     dataset_tags = np.array(dataset_tags)
-    datasets = [d for d in ["FFPP", "CDFv2", "CDFv3"] if d in set(dataset_tags)]
-    dataset_colors = {"FFPP": "#4C72B0", "CDFv2": "#DD8452", "CDFv3": "#55A868"}
+    preferred_order = ["FFPP", "CDFv2", "DFo", "WDF", "UADFV", "CDFv3"]
+    present = set(dataset_tags.tolist())
+    datasets = [d for d in preferred_order if d in present]
+    datasets.extend(sorted(present - set(datasets)))
+    base_colors = {
+        "FFPP": "#4C72B0",
+        "CDFv2": "#DD8452",
+        "DFo": "#55A868",
+        "WDF": "#C44E52",
+        "UADFV": "#8172B3",
+        "CDFv3": "#937860",
+    }
+    fallback_colors = plt.get_cmap("tab20").colors
+    dataset_colors = {
+        dset: base_colors.get(dset, fallback_colors[i % len(fallback_colors)])
+        for i, dset in enumerate(datasets)
+    }
     saved = []
 
     # -- Main: colored by dataset, marker by real/fake -----------------------
@@ -1034,7 +1170,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
 
     # -- Split real/fake panels ----------------------------------------------
     split_path = _output_with_suffix(out_path, "real_fake_split")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), sharex=True, sharey=True)
     for ax, label, title in [(axes[0], 0, "Real videos"), (axes[1], 1, "Fake videos")]:
         for dset in datasets:
             mask = (labels == label) & (dataset_tags == dset)
@@ -1042,8 +1178,8 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray,
                 continue
             ax.scatter(
                 coords[mask, 0], coords[mask, 1],
-                c=dataset_colors[dset], s=30, alpha=0.75,
-                linewidths=0.3, edgecolors="black", label=dset,
+                c=dataset_colors[dset], s=22, alpha=0.8,
+                linewidths=0.2, edgecolors="black", label=dset,
             )
         ax.set_title(title)
         ax.set_xlabel("UMAP dim 1")
