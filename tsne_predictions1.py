@@ -90,6 +90,8 @@ python tsne_predictions1.py \
 
 If --embeddings_out is omitted, embeddings are automatically cached next to the
 figure as <out_stem>_embeddings.npz before UMAP is imported.
+If --embeddings_out points to an existing file, that cache is reused unless
+--force_extract is supplied.
 
 Any of --manifest/--root_dir, --cdfv2_fake_root/--cdfv2_real_root,
 --cdfv3_root/--cdfv3_csv may be omitted to skip that dataset.
@@ -652,11 +654,15 @@ def parse_args():
                         "next to it with suffixes.")
     p.add_argument("--embeddings_out", default="",
                    help="Optional .npz path to cache raw embeddings/labels/probs "
-                        "(useful to re-plot without rerunning the model).")
+                        "(useful to re-plot without rerunning the model). If this "
+                        "file already exists, it is loaded unless --force_extract "
+                        "is set.")
     p.add_argument("--embeddings_npz", default="",
                    help="Optional cached .npz containing embeddings, labels, probs, "
                         "video_ids, and dataset_tags. If supplied, model inference "
                         "and dataset loading are skipped.")
+    p.add_argument("--force_extract", action="store_true",
+                   help="Recompute embeddings even if --embeddings_out already exists.")
 
     # FF++
     p.add_argument("--manifest", default="",
@@ -745,6 +751,35 @@ def _default_embeddings_path(out_path: str) -> str:
     return str(path.with_name(f"{path.stem}_embeddings.npz"))
 
 
+def _load_cached_embeddings(path: str):
+    data = np.load(path, allow_pickle=True)
+    embeddings = data["embeddings"]
+    labels = data["labels"].astype(int)
+    probs = data["probs"]
+    video_ids = data["video_ids"].astype(str).tolist()
+    dataset_tags = data["dataset_tags"].astype(str).tolist()
+    print(f"  Loaded cached embeddings: {embeddings.shape} from {path}")
+    return embeddings, labels, probs, video_ids, dataset_tags
+
+
+def _patch_coverage_for_numba():
+    """
+    Some numba/coverage version pairs fail during import because numba expects
+    coverage.types.Tracer, while newer coverage exposes TTracer. Patch the alias
+    before importing umap/numba so plotting still works on that environment.
+    """
+    try:
+        import coverage
+    except Exception:
+        return
+
+    coverage_types = getattr(coverage, "types", None)
+    if coverage_types is None:
+        return
+    if not hasattr(coverage_types, "Tracer") and hasattr(coverage_types, "TTracer"):
+        coverage_types.Tracer = coverage_types.TTracer
+
+
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -754,13 +789,13 @@ def main():
     print(f"\n{sep}\n  UMAP of VideoViT predictions — FF++ / CDFv2 / CDFv3\n{sep}")
     print(f"  Device     : {device}")
     if args.embeddings_npz:
-        data = np.load(args.embeddings_npz, allow_pickle=True)
-        embeddings = data["embeddings"]
-        labels = data["labels"].astype(int)
-        probs = data["probs"]
-        video_ids = data["video_ids"].astype(str).tolist()
-        dataset_tags = data["dataset_tags"].astype(str).tolist()
-        print(f"  Loaded cached embeddings: {embeddings.shape} from {args.embeddings_npz}")
+        embeddings, labels, probs, video_ids, dataset_tags = _load_cached_embeddings(
+            args.embeddings_npz
+        )
+    elif args.embeddings_out and Path(args.embeddings_out).is_file() and not args.force_extract:
+        embeddings, labels, probs, video_ids, dataset_tags = _load_cached_embeddings(
+            args.embeddings_out
+        )
     else:
         if not args.checkpoint:
             raise ValueError("Supply --checkpoint or --embeddings_npz.")
@@ -859,6 +894,7 @@ def main():
     # ---- UMAP ----------------------------------------------------------------
     from sklearn.preprocessing import StandardScaler
     os.environ.setdefault("NUMBA_DISABLE_COVERAGE", "1")
+    _patch_coverage_for_numba()
     try:
         import umap
     except ImportError as exc:
