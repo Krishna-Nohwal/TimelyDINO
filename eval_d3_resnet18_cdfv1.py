@@ -1,5 +1,5 @@
 """
-Evaluate D3 ResNet-18 on the CDFv1 manifest format used in this repo.
+Evaluate D3 on the CDFv1 manifest format used in this repo.
 
 Example
 -------
@@ -7,6 +7,7 @@ python eval_d3_resnet18_cdfv1.py \
     --cdf_root /media/tarun/B482367C823642E2/usr/cdfv1_onct_out \
     --cdf_csv /media/tarun/B482367C823642E2/usr/cdfv1_onct_out/manifest_cdfv1_onct.csv \
     --d3_repo /path/to/D3 \
+    --encoder ResNet-18 \
     --batch_size 16 --num_workers 8
 
 Notes
@@ -51,7 +52,7 @@ RESAMPLE_BICUBIC = getattr(Image, "Resampling", Image).BICUBIC
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate D3 ResNet-18 second-order features on CDFv1."
+        description="Evaluate D3 second-order features on CDFv1."
     )
     parser.add_argument(
         "--cdf_root",
@@ -67,6 +68,23 @@ def parse_args():
         "--d3_repo",
         default="",
         help="Optional path to the cloned Zig-HS/D3 repo. If provided, imports D3_model.py from it.",
+    )
+    parser.add_argument(
+        "--encoder",
+        default="ResNet-18",
+        choices=[
+            "CLIP-16",
+            "CLIP-32",
+            "XCLIP-16",
+            "XCLIP-32",
+            "DINO-base",
+            "DINO-large",
+            "ResNet-18",
+            "VGG-16",
+            "EfficientNet-b4",
+            "MobileNet-v3",
+        ],
+        help="D3 backbone encoder to use. Non-ResNet encoders require --d3_repo.",
     )
     parser.add_argument("--loss", default="l2", choices=["l2", "cos"])
     parser.add_argument("--num_frames", default=16, type=int)
@@ -86,7 +104,7 @@ def parse_args():
     )
     parser.add_argument(
         "--save_results",
-        default="d3_resnet18_cdfv1_results.csv",
+        default="d3_cdfv1_results.csv",
         help="Per-video CSV path. Use empty string to disable.",
     )
     return parser.parse_args()
@@ -240,7 +258,7 @@ def build_fallback_d3_model(loss_type: str):
     return D3Model()
 
 
-def load_d3_resnet18(args, device: torch.device):
+def load_d3_model(args, device: torch.device):
     if args.d3_repo:
         repo = Path(args.d3_repo).expanduser().resolve()
         for candidate in [repo, repo / "models"]:
@@ -254,11 +272,19 @@ def load_d3_resnet18(args, device: torch.device):
                 from D3_model import D3_model
             else:
                 from models import D3_model
-            model = D3_model(encoder_type="ResNet-18", loss_type=args.loss)
+            model = D3_model(encoder_type=args.encoder, loss_type=args.loss)
             print(f"  D3 model source: imported from {import_stmt}")
             return model.to(device).eval()
         except Exception as exc:
             import_error = exc
+
+    if args.encoder != "ResNet-18":
+        raise RuntimeError(
+            f"Could not import D3_model.py for encoder={args.encoder}.\n"
+            "Non-ResNet encoders should use the original D3 implementation, so pass:\n"
+            "  --d3_repo /path/to/D3\n"
+            f"Last import error: {import_error}"
+        )
 
     print(f"  [INFO] Could not import D3_model.py ({import_error}).")
     print("  [INFO] Using an embedded D3-compatible ResNet-18 fallback.")
@@ -299,13 +325,13 @@ def main():
 
     sep = "=" * 88
     print("\n" + sep)
-    print("D3 ResNet-18 evaluation on CDFv1")
+    print("D3 evaluation on CDFv1")
     print(sep)
     print(f"Device       : {device}")
     print(f"CDF root     : {args.cdf_root}")
     print(f"CDF CSV      : {args.cdf_csv}")
     print(f"D3 repo      : {args.d3_repo or '(not provided; import/fallback)'}")
-    print(f"Encoder      : ResNet-18")
+    print(f"Encoder      : {args.encoder}")
     print(f"Loss         : {args.loss}")
     print(f"Frames/video : {args.num_frames} ({args.sampling})")
     print(f"Preprocess   : {IMG_SIZE}x{IMG_SIZE}, ImageNet norm, "
@@ -348,7 +374,7 @@ def main():
     )
 
     print("\nLoading model")
-    model = load_d3_resnet18(args, device)
+    model = load_d3_model(args, device)
 
     autocast_ctx = (
         torch.autocast(device_type=device.type, dtype=torch.float16)
