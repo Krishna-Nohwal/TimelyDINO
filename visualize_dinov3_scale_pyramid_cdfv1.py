@@ -367,6 +367,29 @@ def compute_first_order_scale_dynamics(emb: torch.Tensor, scales: list[float]):
     }
 
 
+def compute_second_order_scale_dynamics(first_order: dict, scales: list[float]):
+    centers = np.array(
+        [(scales[i] + scales[i + 1]) / 2.0 for i in range(len(scales) - 1)],
+        dtype=np.float32,
+    )
+    delta_centers = np.abs(np.diff(centers)).reshape(1, -1)
+
+    out = {
+        "center_scale": centers,
+        "delta_center_scale": delta_centers.squeeze(0),
+    }
+    for key in [
+        "l2_first_order",
+        "cosine_similarity_first_order",
+        "cosine_distance_first_order",
+    ]:
+        signed = np.diff(first_order[key], axis=1) / delta_centers
+        second_key = key.replace("first_order", "second_order")
+        out[second_key] = np.abs(signed)
+        out[f"{second_key}_signed"] = signed
+    return out
+
+
 def plot_similarity_curves(values_to_full: np.ndarray, labels: np.ndarray, scales, out_path: Path, distance: str):
     x = np.arange(len(scales))
     fig, ax = plt.subplots(figsize=(8.5, 4.8))
@@ -429,6 +452,47 @@ def plot_first_order_scale_dynamics(first_order: dict, labels: np.ndarray, scale
 
     axes[0].legend(frameon=False)
     fig.suptitle(r"First-order scale differences normalized by $\Delta s_k$", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_second_order_scale_dynamics(second_order: dict, labels: np.ndarray, scales, out_path: Path):
+    x = np.arange(len(scales) - 2)
+    pair_labels = [
+        f"{scales[i]:g}->{scales[i+1]:g}->{scales[i+2]:g}"
+        for i in range(len(scales) - 2)
+    ]
+    colors = {0: "#0057FF", 1: "#E31A1C"}
+    names = {0: "real", 1: "fake"}
+    panels = [
+        ("l2_second_order", r"$|\Delta F_1^{L2}| / \Delta c_k$", "L2 second-order feature"),
+        ("cosine_similarity_second_order", r"$|\Delta F_1^{Cos}| / \Delta c_k$", "Cosine second-order feature"),
+        ("cosine_distance_second_order", r"$|\Delta F_1^{1-Cos}| / \Delta c_k$", "Cosine-distance second-order feature"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(19.0, 4.9), sharex=True)
+    for ax, (key, ylabel, title) in zip(axes, panels):
+        values = second_order[key]
+        for label in [0, 1]:
+            mask = labels == label
+            if not mask.any():
+                continue
+            for y in values[mask]:
+                ax.plot(x, y, color=colors[label], alpha=0.12, linewidth=0.8)
+            mean = values[mask].mean(axis=0)
+            std = values[mask].std(axis=0)
+            ax.plot(x, mean, marker="o", color=colors[label], linewidth=2.4, label=f"{names[label]} mean")
+            ax.fill_between(x, mean - std, mean + std, color=colors[label], alpha=0.14)
+        ax.set_xticks(x)
+        ax.set_xticklabels(pair_labels, rotation=30, ha="right")
+        ax.set_xlabel("Consecutive scale triplet")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.25)
+
+    axes[0].legend(frameon=False)
+    fig.suptitle(r"Second-order scale differences: difference of first-order features", fontsize=13)
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -692,6 +756,7 @@ def main():
     cosine_to_full, _, _ = compute_cross_scale_metrics(emb, "cosine")
     l2_to_full, _, _ = compute_cross_scale_metrics(emb, "l2")
     first_order = compute_first_order_scale_dynamics(emb, scales)
+    second_order = compute_second_order_scale_dynamics(first_order, scales)
 
     plot_similarity_curves(values_to_full, labels, scales, out_dir / output_names["to_full"], args.distance)
     plot_adjacent_similarity(adjacent, labels, scales, out_dir / output_names["adjacent"], args.distance)
@@ -701,6 +766,12 @@ def main():
         labels,
         scales,
         out_dir / "first_order_scale_differences.png",
+    )
+    plot_second_order_scale_dynamics(
+        second_order,
+        labels,
+        scales,
+        out_dir / "second_order_scale_differences.png",
     )
     plot_cosine_l2_to_full(
         cosine_to_full,
@@ -756,11 +827,36 @@ def main():
             })
     pd.DataFrame(first_order_rows).to_csv(out_dir / "first_order_scale_differences.csv", index=False)
 
+    second_order_rows = []
+    for i, item in enumerate(sampled):
+        for triplet_idx in range(n_scales - 2):
+            second_order_rows.append({
+                "image_index": i,
+                "sample_dir": item["sample_dir"],
+                "image_path": item["image_path"],
+                "video_id": item["video_id"],
+                "label": item["label"],
+                "scale_k": scales[triplet_idx],
+                "scale_k_plus_1": scales[triplet_idx + 1],
+                "scale_k_plus_2": scales[triplet_idx + 2],
+                "first_order_center_k": float(second_order["center_scale"][triplet_idx]),
+                "first_order_center_k_plus_1": float(second_order["center_scale"][triplet_idx + 1]),
+                "delta_center_scale": float(second_order["delta_center_scale"][triplet_idx]),
+                "l2_second_order": float(second_order["l2_second_order"][i, triplet_idx]),
+                "l2_second_order_signed": float(second_order["l2_second_order_signed"][i, triplet_idx]),
+                "cosine_similarity_second_order": float(second_order["cosine_similarity_second_order"][i, triplet_idx]),
+                "cosine_similarity_second_order_signed": float(second_order["cosine_similarity_second_order_signed"][i, triplet_idx]),
+                "cosine_distance_second_order": float(second_order["cosine_distance_second_order"][i, triplet_idx]),
+                "cosine_distance_second_order_signed": float(second_order["cosine_distance_second_order_signed"][i, triplet_idx]),
+            })
+    pd.DataFrame(second_order_rows).to_csv(out_dir / "second_order_scale_differences.csv", index=False)
+
     print("\nSaved outputs:")
     for name in [
         "pyramid_examples.png",
         output_names["to_full"],
         "first_order_scale_differences.png",
+        "second_order_scale_differences.png",
         "cosine_and_l2_to_full_scale.png",
         output_names["adjacent"],
         output_names["heatmap"],
@@ -768,6 +864,7 @@ def main():
         "umap_colored_by_scale.png",
         "scale_embedding_summary.csv",
         "first_order_scale_differences.csv",
+        "second_order_scale_differences.csv",
     ]:
         print(f"  {out_dir / name}")
     print("=" * 88)
