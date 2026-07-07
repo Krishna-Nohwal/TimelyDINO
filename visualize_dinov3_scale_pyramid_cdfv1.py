@@ -3,7 +3,7 @@ Visualize DINOv3 embeddings across a scale pyramid on CDFv1 images.
 
 For each sampled CDFv1 frame image:
   1. resize/crop to a base square input,
-  2. create scale levels by downsampling to smaller sizes,
+  2. create scale levels by progressively downsampling from one level to the next,
   3. feed each level to DINOv3 at its actual smaller resolution,
   4. plot same-image cross-scale similarities,
   5. plot a global UMAP with one panel per scale/resolution.
@@ -219,12 +219,14 @@ def make_pyramid_pil(
     img = img.resize((input_size, input_size), RESAMPLE_BICUBIC)
 
     levels = []
+    previous = img
     for size in level_sizes:
         if size == input_size:
             level = img.copy()
         else:
-            level = img.resize((size, size), RESAMPLE_BICUBIC)
+            level = previous.resize((size, size), RESAMPLE_BICUBIC)
         levels.append(level)
+        previous = level
     return levels
 
 
@@ -624,6 +626,7 @@ def main():
     print(f"Base size    : {args.input_size}x{args.input_size}")
     print(f"Scales       : {', '.join(f'{s:g}' for s in scales)}")
     print(f"Fed sizes    : {', '.join(f'{s}x{s}' for s in level_sizes)}")
+    print("Pyramid mode : progressive downsample, each level from previous level")
     print(f"Distance     : {args.distance}")
     print(f"Output dir   : {out_dir}")
     print(f"Center crop  : {not args.no_center_crop}")
