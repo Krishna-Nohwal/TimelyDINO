@@ -15,8 +15,8 @@ python visualize_dinov3_scale_pyramid_cdfv1.py ^
   --cdf_csv E:\\Work\\cdfv1_onct_out\\manifest_cdfv1_onct.csv ^
   --num_images 50 ^
   --output_dir dinov3_scale_pyramid_cdfv1 ^
-  --input_size 224 ^
-  --sizes 224,192,160,128,96,64,50 ^
+  --input_size 256 ^
+  --sizes 256,224,192,160,128,96,64,48 ^
   --batch_size 16
 """
 
@@ -59,16 +59,16 @@ def parse_args():
     parser.add_argument("--num_images", default=50, type=int)
     parser.add_argument("--seed", default=7, type=int)
     parser.add_argument("--sample_mode", default="balanced", choices=["balanced", "random"])
-    parser.add_argument("--input_size", default=224, type=int)
+    parser.add_argument("--input_size", default=256, type=int)
     parser.add_argument(
         "--scales",
         default="1.0,0.85,0.72,0.60,0.50,0.42,0.35,0.30",
-        help="Scale factors. Level size = round(input_size * scale), fed at that actual size.",
+        help="Scale factors. Level size is rounded to a multiple of 16 before being fed.",
     )
     parser.add_argument(
         "--sizes",
-        default="",
-        help="Optional comma-separated exact square sizes to feed, e.g. 224,192,160,128,96,64,50. Overrides --scales.",
+        default="256,224,192,160,128,96,64,48",
+        help="Comma-separated exact square sizes to feed, e.g. 256,224,192,160,128,96,64,48. Must be divisible by 16. Overrides --scales.",
     )
     parser.add_argument("--output_dir", default="dinov3_scale_pyramid_cdfv1")
     parser.add_argument("--batch_size", default=16, type=int)
@@ -98,7 +98,7 @@ def parse_scales(text: str) -> list[float]:
     return scales
 
 
-def parse_sizes(text: str, input_size: int) -> list[int]:
+def parse_sizes(text: str, input_size: int, patch_size: int = 16) -> list[int]:
     sizes = [int(x.strip()) for x in text.split(",") if x.strip()]
     if len(sizes) < 2:
         raise ValueError("Need at least two sizes.")
@@ -106,7 +106,26 @@ def parse_sizes(text: str, input_size: int) -> list[int]:
         raise ValueError("Sizes must be >= 2 pixels.")
     if any(s > input_size for s in sizes):
         raise ValueError("Sizes cannot exceed --input_size.")
+    if any(s % patch_size != 0 for s in sizes):
+        bad = [s for s in sizes if s % patch_size != 0]
+        raise ValueError(f"All fed sizes must be divisible by {patch_size}. Bad sizes: {bad}")
     return sizes
+
+
+def round_to_patch_multiple(size: float, input_size: int, patch_size: int = 16) -> int:
+    rounded = int(round(size / patch_size) * patch_size)
+    rounded = max(patch_size, rounded)
+    return min(input_size, rounded)
+
+
+def unique_preserve_order(values: list[int]) -> list[int]:
+    seen = set()
+    unique = []
+    for value in values:
+        if value not in seen:
+            unique.append(value)
+            seen.add(value)
+    return unique
 
 
 def video_id_from_sample_dir(sample_dir: str) -> str:
@@ -426,12 +445,19 @@ def plot_umap_by_color_scale(coords: np.ndarray, scale_indices: np.ndarray, scal
 
 def main():
     args = parse_args()
+    if args.input_size % 16 != 0:
+        raise ValueError("--input_size must be divisible by 16 for the DINOv3 patch16 backbone.")
+
     if args.sizes.strip():
-        level_sizes = parse_sizes(args.sizes, args.input_size)
+        level_sizes = parse_sizes(args.sizes, args.input_size, patch_size=16)
         scales = [size / args.input_size for size in level_sizes]
     else:
         scales = parse_scales(args.scales)
-        level_sizes = [max(2, int(round(args.input_size * scale))) for scale in scales]
+        level_sizes = unique_preserve_order([
+            round_to_patch_multiple(args.input_size * scale, args.input_size, patch_size=16)
+            for scale in scales
+        ])
+        scales = [size / args.input_size for size in level_sizes]
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
