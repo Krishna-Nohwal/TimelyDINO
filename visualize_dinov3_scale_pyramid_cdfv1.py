@@ -373,6 +373,47 @@ def plot_similarity_curves(values_to_full: np.ndarray, labels: np.ndarray, scale
     plt.close(fig)
 
 
+def plot_cosine_l2_to_full(
+    cosine_to_full: np.ndarray,
+    l2_to_full: np.ndarray,
+    labels: np.ndarray,
+    scales,
+    out_path: Path,
+):
+    x = np.arange(len(scales))
+    colors = {0: "#0057FF", 1: "#E31A1C"}
+    names = {0: "real", 1: "fake"}
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8), sharex=True)
+    panels = [
+        (axes[0], cosine_to_full, "Cosine similarity to original", "higher means closer"),
+        (axes[1], l2_to_full, "L2 distance to original", "lower means closer"),
+    ]
+
+    for ax, values, ylabel, hint in panels:
+        for label in [0, 1]:
+            mask = labels == label
+            if not mask.any():
+                continue
+            for y in values[mask]:
+                ax.plot(x, y, color=colors[label], alpha=0.12, linewidth=0.8)
+            mean = values[mask].mean(axis=0)
+            std = values[mask].std(axis=0)
+            ax.plot(x, mean, color=colors[label], linewidth=2.5, label=f"{names[label]} mean")
+            ax.fill_between(x, mean - std, mean + std, color=colors[label], alpha=0.14)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{s:g}" for s in scales], rotation=25, ha="right")
+        ax.set_xlabel("Scale factor")
+        ax.set_ylabel(ylabel)
+        ax.set_title(hint)
+        ax.grid(True, alpha=0.25)
+
+    axes[0].legend(frameon=False)
+    fig.suptitle("DINOv3 embedding change from original image to downsampled images", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_adjacent_similarity(adjacent: np.ndarray, labels: np.ndarray, scales, out_path: Path, distance: str):
     x = np.arange(len(scales) - 1)
     pair_labels = [f"{scales[i]:g}->{scales[i+1]:g}" for i in range(len(scales) - 1)]
@@ -586,10 +627,19 @@ def main():
 
     values_to_full, adjacent, scale_pair_values = compute_cross_scale_metrics(emb, args.distance)
     output_names = metric_output_names(args.distance)
+    cosine_to_full, _, _ = compute_cross_scale_metrics(emb, "cosine")
+    l2_to_full, _, _ = compute_cross_scale_metrics(emb, "l2")
 
     plot_similarity_curves(values_to_full, labels, scales, out_dir / output_names["to_full"], args.distance)
     plot_adjacent_similarity(adjacent, labels, scales, out_dir / output_names["adjacent"], args.distance)
     plot_average_heatmap(scale_pair_values, scales, out_dir / output_names["heatmap"], args.distance)
+    plot_cosine_l2_to_full(
+        cosine_to_full,
+        l2_to_full,
+        labels,
+        scales,
+        out_dir / "cosine_and_l2_to_full_scale.png",
+    )
 
     print("\nComputing UMAP/PCA coordinates ...")
     coords, method_name = compute_umap_or_fallback(embeddings_np, args.seed)
@@ -611,6 +661,8 @@ def main():
                 "fed_input_size": pyramid_images[i][s_idx].size[0],
                 "distance_metric": args.distance,
                 "value_to_full": float(values_to_full[i, s_idx]),
+                "cosine_to_full": float(cosine_to_full[i, s_idx]),
+                "l2_to_full": float(l2_to_full[i, s_idx]),
                 "umap_x": float(coords[i * n_scales + s_idx, 0]),
                 "umap_y": float(coords[i * n_scales + s_idx, 1]),
                 "projection": method_name,
@@ -621,6 +673,7 @@ def main():
     for name in [
         "pyramid_examples.png",
         output_names["to_full"],
+        "cosine_and_l2_to_full_scale.png",
         output_names["adjacent"],
         output_names["heatmap"],
         "umap_each_scale.png",
