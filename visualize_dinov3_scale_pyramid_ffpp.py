@@ -17,6 +17,7 @@ python visualize_dinov3_scale_pyramid_ffpp.py \
   --output_dir dinov3_scale_pyramid_ffpp \
   --input_size 256 \
   --sizes 256,224,192,160,128,96,64,48 \
+  --distance cosine \
   --batch_size 16
 """
 
@@ -75,6 +76,12 @@ def parse_args():
     )
     parser.add_argument("--output_dir", default="dinov3_scale_pyramid_ffpp")
     parser.add_argument("--batch_size", default=16, type=int)
+    parser.add_argument(
+        "--distance",
+        default="cosine",
+        choices=["cosine", "l2"],
+        help="Cross-scale embedding measure. cosine=similarity, l2=raw Euclidean distance.",
+    )
     parser.add_argument("--fp32", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no_center_crop", action="store_true")
@@ -305,27 +312,63 @@ def save_pyramid_grid(sampled: list[dict], pyramid_images: list[list[Image.Image
     plt.close(fig)
 
 
-def plot_similarity_curves(sim_to_full: np.ndarray, labels: np.ndarray, scales, out_path: Path):
+def metric_display(distance: str) -> tuple[str, str, str]:
+    if distance == "l2":
+        return "L2 distance", "distance", "lower means closer"
+    return "Cosine similarity", "similarity", "higher means closer"
+
+
+def metric_output_names(distance: str) -> dict[str, str]:
+    if distance == "l2":
+        return {
+            "to_full": "l2_to_full_scale.png",
+            "adjacent": "adjacent_scale_l2.png",
+            "heatmap": "mean_cross_scale_l2_heatmap.png",
+        }
+    return {
+        "to_full": "similarity_to_full_scale.png",
+        "adjacent": "adjacent_scale_similarity.png",
+        "heatmap": "mean_cross_scale_similarity_heatmap.png",
+    }
+
+
+def compute_cross_scale_metrics(emb: torch.Tensor, distance: str):
+    emb_float = emb.float()
+    if distance == "l2":
+        to_full = torch.linalg.vector_norm(emb_float - emb_float[:, :1, :], dim=-1).numpy()
+        adjacent = torch.linalg.vector_norm(emb_float[:, :-1, :] - emb_float[:, 1:, :], dim=-1).numpy()
+        pairwise = torch.cdist(emb_float, emb_float, p=2).numpy()
+        return to_full, adjacent, pairwise
+
+    emb_norm = F.normalize(emb_float, dim=-1)
+    to_full = (emb_norm * emb_norm[:, :1, :]).sum(dim=-1).numpy()
+    adjacent = (emb_norm[:, :-1, :] * emb_norm[:, 1:, :]).sum(dim=-1).numpy()
+    pairwise = torch.einsum("isc,itc->ist", emb_norm, emb_norm).numpy()
+    return to_full, adjacent, pairwise
+
+
+def plot_similarity_curves(values_to_full: np.ndarray, labels: np.ndarray, scales, out_path: Path, distance: str):
     x = np.arange(len(scales))
     fig, ax = plt.subplots(figsize=(8.5, 4.8))
     colors = {0: "#0057FF", 1: "#E31A1C"}
     names = {0: "real", 1: "fake"}
+    measure_name, measure_word, direction_hint = metric_display(distance)
     for label in [0, 1]:
         mask = labels == label
         if not mask.any():
             continue
-        for y in sim_to_full[mask]:
+        for y in values_to_full[mask]:
             ax.plot(x, y, color=colors[label], alpha=0.12, linewidth=0.8)
-        mean = sim_to_full[mask].mean(axis=0)
-        std = sim_to_full[mask].std(axis=0)
+        mean = values_to_full[mask].mean(axis=0)
+        std = values_to_full[mask].std(axis=0)
         ax.plot(x, mean, color=colors[label], linewidth=2.5, label=f"{names[label]} mean")
         ax.fill_between(x, mean - std, mean + std, color=colors[label], alpha=0.14)
 
     ax.set_xticks(x)
     ax.set_xticklabels([f"{s:g}" for s in scales])
     ax.set_xlabel("Scale factor")
-    ax.set_ylabel("Cosine similarity to full-scale embedding")
-    ax.set_title("Same-image DINOv3 embedding similarity across scale levels")
+    ax.set_ylabel(f"{measure_name} to full-scale embedding")
+    ax.set_title(f"Same-image DINOv3 embedding {measure_word} across scale levels ({direction_hint})")
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
     fig.tight_layout()
@@ -333,12 +376,13 @@ def plot_similarity_curves(sim_to_full: np.ndarray, labels: np.ndarray, scales, 
     plt.close(fig)
 
 
-def plot_adjacent_similarity(adjacent: np.ndarray, labels: np.ndarray, scales, out_path: Path):
+def plot_adjacent_similarity(adjacent: np.ndarray, labels: np.ndarray, scales, out_path: Path, distance: str):
     x = np.arange(len(scales) - 1)
     pair_labels = [f"{scales[i]:g}->{scales[i+1]:g}" for i in range(len(scales) - 1)]
     fig, ax = plt.subplots(figsize=(9.5, 4.8))
     colors = {0: "#0057FF", 1: "#E31A1C"}
     names = {0: "real", 1: "fake"}
+    measure_name, _, direction_hint = metric_display(distance)
     for label in [0, 1]:
         mask = labels == label
         if not mask.any():
@@ -350,8 +394,8 @@ def plot_adjacent_similarity(adjacent: np.ndarray, labels: np.ndarray, scales, o
     ax.set_xticks(x)
     ax.set_xticklabels(pair_labels, rotation=30, ha="right")
     ax.set_xlabel("Adjacent scale pair")
-    ax.set_ylabel("Adjacent embedding cosine similarity")
-    ax.set_title("DINOv3 similarity between neighboring scale levels")
+    ax.set_ylabel(f"Adjacent embedding {measure_name}")
+    ax.set_title(f"DINOv3 {measure_name.lower()} between neighboring scale levels ({direction_hint})")
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
     fig.tight_layout()
@@ -359,17 +403,21 @@ def plot_adjacent_similarity(adjacent: np.ndarray, labels: np.ndarray, scales, o
     plt.close(fig)
 
 
-def plot_average_heatmap(scale_pair_sims: np.ndarray, scales, out_path: Path):
-    mean_mat = scale_pair_sims.mean(axis=0)
+def plot_average_heatmap(scale_pair_values: np.ndarray, scales, out_path: Path, distance: str):
+    mean_mat = scale_pair_values.mean(axis=0)
     fig, ax = plt.subplots(figsize=(6.2, 5.4))
-    im = ax.imshow(mean_mat, vmin=np.percentile(mean_mat, 2), vmax=1.0, cmap="viridis")
+    if distance == "l2":
+        im = ax.imshow(mean_mat, vmin=0.0, vmax=np.percentile(mean_mat, 98), cmap="magma")
+    else:
+        im = ax.imshow(mean_mat, vmin=np.percentile(mean_mat, 2), vmax=1.0, cmap="viridis")
+    measure_name, _, _ = metric_display(distance)
     ax.set_xticks(np.arange(len(scales)))
     ax.set_yticks(np.arange(len(scales)))
     ax.set_xticklabels([f"{s:g}" for s in scales], rotation=45, ha="right")
     ax.set_yticklabels([f"{s:g}" for s in scales])
     ax.set_xlabel("Scale factor")
     ax.set_ylabel("Scale factor")
-    ax.set_title("Mean same-image cross-scale cosine similarity")
+    ax.set_title(f"Mean same-image cross-scale {measure_name.lower()}")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
@@ -480,6 +528,7 @@ def main():
     print(f"Base size    : {args.input_size}x{args.input_size}")
     print(f"Scales       : {', '.join(f'{s:g}' for s in scales)}")
     print(f"Fed sizes    : {', '.join(f'{s}x{s}' for s in level_sizes)}")
+    print(f"Distance     : {args.distance}")
     print(f"Output dir   : {out_dir}")
     print(f"Center crop  : {not args.no_center_crop}")
 
@@ -537,15 +586,13 @@ def main():
     emb = torch.stack(embeddings_by_scale, dim=1)  # (N images, S scales, C)
     embeddings = emb.reshape(n_images * n_scales, -1)
     embeddings_np = embeddings.numpy().astype(np.float32)
-    emb_norm = F.normalize(emb.float(), dim=-1)
 
-    sim_to_full = (emb_norm * emb_norm[:, :1, :]).sum(dim=-1).numpy()
-    adjacent = (emb_norm[:, :-1, :] * emb_norm[:, 1:, :]).sum(dim=-1).numpy()
-    scale_pair_sims = torch.einsum("isc,itc->ist", emb_norm, emb_norm).numpy()
+    values_to_full, adjacent, scale_pair_values = compute_cross_scale_metrics(emb, args.distance)
+    output_names = metric_output_names(args.distance)
 
-    plot_similarity_curves(sim_to_full, labels, scales, out_dir / "similarity_to_full_scale.png")
-    plot_adjacent_similarity(adjacent, labels, scales, out_dir / "adjacent_scale_similarity.png")
-    plot_average_heatmap(scale_pair_sims, scales, out_dir / "mean_cross_scale_similarity_heatmap.png")
+    plot_similarity_curves(values_to_full, labels, scales, out_dir / output_names["to_full"], args.distance)
+    plot_adjacent_similarity(adjacent, labels, scales, out_dir / output_names["adjacent"], args.distance)
+    plot_average_heatmap(scale_pair_values, scales, out_dir / output_names["heatmap"], args.distance)
 
     print("\nComputing UMAP/PCA coordinates ...")
     coords, method_name = compute_umap_or_fallback(embeddings_np, args.seed)
@@ -565,7 +612,8 @@ def main():
                 "label": item["label"],
                 "scale": scale,
                 "fed_input_size": pyramid_images[i][s_idx].size[0],
-                "sim_to_full": float(sim_to_full[i, s_idx]),
+                "distance_metric": args.distance,
+                "value_to_full": float(values_to_full[i, s_idx]),
                 "umap_x": float(coords[i * n_scales + s_idx, 0]),
                 "umap_y": float(coords[i * n_scales + s_idx, 1]),
                 "projection": method_name,
@@ -575,9 +623,9 @@ def main():
     print("\nSaved outputs:")
     for name in [
         "pyramid_examples.png",
-        "similarity_to_full_scale.png",
-        "adjacent_scale_similarity.png",
-        "mean_cross_scale_similarity_heatmap.png",
+        output_names["to_full"],
+        output_names["adjacent"],
+        output_names["heatmap"],
         "umap_each_scale.png",
         "umap_colored_by_scale.png",
         "scale_embedding_summary.csv",
