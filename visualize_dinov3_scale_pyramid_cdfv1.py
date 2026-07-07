@@ -344,6 +344,27 @@ def compute_cross_scale_metrics(emb: torch.Tensor, distance: str):
     return to_full, adjacent, pairwise
 
 
+def compute_first_order_scale_dynamics(emb: torch.Tensor, scales: list[float]):
+    emb_float = emb.float()
+    deltas = torch.tensor(
+        [abs(scales[i + 1] - scales[i]) for i in range(len(scales) - 1)],
+        dtype=emb_float.dtype,
+        device=emb_float.device,
+    ).view(1, -1)
+
+    adjacent_l2 = torch.linalg.vector_norm(emb_float[:, :-1, :] - emb_float[:, 1:, :], dim=-1)
+    emb_norm = F.normalize(emb_float, dim=-1)
+    adjacent_cos = (emb_norm[:, :-1, :] * emb_norm[:, 1:, :]).sum(dim=-1)
+    adjacent_cos_distance = 1.0 - adjacent_cos
+
+    return {
+        "delta_scale": deltas.squeeze(0).cpu().numpy(),
+        "l2_first_order": (adjacent_l2 / deltas).cpu().numpy(),
+        "cosine_distance_first_order": (adjacent_cos_distance / deltas).cpu().numpy(),
+        "cosine_similarity_first_order": (adjacent_cos / deltas).cpu().numpy(),
+    }
+
+
 def plot_similarity_curves(values_to_full: np.ndarray, labels: np.ndarray, scales, out_path: Path, distance: str):
     x = np.arange(len(scales))
     fig, ax = plt.subplots(figsize=(8.5, 4.8))
@@ -368,6 +389,43 @@ def plot_similarity_curves(values_to_full: np.ndarray, labels: np.ndarray, scale
     ax.set_title(f"Same-image DINOv3 embedding {measure_word} across scale levels ({direction_hint})")
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_first_order_scale_dynamics(first_order: dict, labels: np.ndarray, scales, out_path: Path):
+    x = np.arange(len(scales) - 1)
+    pair_labels = [f"{scales[i]:g}->{scales[i+1]:g}" for i in range(len(scales) - 1)]
+    colors = {0: "#0057FF", 1: "#E31A1C"}
+    names = {0: "real", 1: "fake"}
+    panels = [
+        ("l2_first_order", r"$\|F_0^k-F_0^{k+1}\|_2 / \Delta s_k$", "First-order L2 scale dynamics"),
+        ("cosine_distance_first_order", r"$(1-\cos(F_0^k,F_0^{k+1})) / \Delta s_k$", "First-order cosine-distance scale dynamics"),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14.0, 4.9), sharex=True)
+    for ax, (key, ylabel, title) in zip(axes, panels):
+        values = first_order[key]
+        for label in [0, 1]:
+            mask = labels == label
+            if not mask.any():
+                continue
+            for y in values[mask]:
+                ax.plot(x, y, color=colors[label], alpha=0.12, linewidth=0.8)
+            mean = values[mask].mean(axis=0)
+            std = values[mask].std(axis=0)
+            ax.plot(x, mean, marker="o", color=colors[label], linewidth=2.4, label=f"{names[label]} mean")
+            ax.fill_between(x, mean - std, mean + std, color=colors[label], alpha=0.14)
+        ax.set_xticks(x)
+        ax.set_xticklabels(pair_labels, rotation=30, ha="right")
+        ax.set_xlabel("Adjacent scale pair")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.25)
+
+    axes[0].legend(frameon=False)
+    fig.suptitle(r"First-order scale differences normalized by $\Delta s_k$", fontsize=13)
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -629,10 +687,17 @@ def main():
     output_names = metric_output_names(args.distance)
     cosine_to_full, _, _ = compute_cross_scale_metrics(emb, "cosine")
     l2_to_full, _, _ = compute_cross_scale_metrics(emb, "l2")
+    first_order = compute_first_order_scale_dynamics(emb, scales)
 
     plot_similarity_curves(values_to_full, labels, scales, out_dir / output_names["to_full"], args.distance)
     plot_adjacent_similarity(adjacent, labels, scales, out_dir / output_names["adjacent"], args.distance)
     plot_average_heatmap(scale_pair_values, scales, out_dir / output_names["heatmap"], args.distance)
+    plot_first_order_scale_dynamics(
+        first_order,
+        labels,
+        scales,
+        out_dir / "first_order_scale_differences.png",
+    )
     plot_cosine_l2_to_full(
         cosine_to_full,
         l2_to_full,
@@ -669,16 +734,36 @@ def main():
             })
     pd.DataFrame(rows).to_csv(out_dir / "scale_embedding_summary.csv", index=False)
 
+    first_order_rows = []
+    for i, item in enumerate(sampled):
+        for pair_idx in range(n_scales - 1):
+            first_order_rows.append({
+                "image_index": i,
+                "sample_dir": item["sample_dir"],
+                "image_path": item["image_path"],
+                "video_id": item["video_id"],
+                "label": item["label"],
+                "scale_k": scales[pair_idx],
+                "scale_k_plus_1": scales[pair_idx + 1],
+                "delta_scale": float(first_order["delta_scale"][pair_idx]),
+                "l2_first_order": float(first_order["l2_first_order"][i, pair_idx]),
+                "cosine_distance_first_order": float(first_order["cosine_distance_first_order"][i, pair_idx]),
+                "cosine_similarity_first_order": float(first_order["cosine_similarity_first_order"][i, pair_idx]),
+            })
+    pd.DataFrame(first_order_rows).to_csv(out_dir / "first_order_scale_differences.csv", index=False)
+
     print("\nSaved outputs:")
     for name in [
         "pyramid_examples.png",
         output_names["to_full"],
+        "first_order_scale_differences.png",
         "cosine_and_l2_to_full_scale.png",
         output_names["adjacent"],
         output_names["heatmap"],
         "umap_each_scale.png",
         "umap_colored_by_scale.png",
         "scale_embedding_summary.csv",
+        "first_order_scale_differences.csv",
     ]:
         print(f"  {out_dir / name}")
     print("=" * 88)
