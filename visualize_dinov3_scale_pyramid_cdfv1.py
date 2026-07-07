@@ -402,11 +402,12 @@ def plot_first_order_scale_dynamics(first_order: dict, labels: np.ndarray, scale
     colors = {0: "#0057FF", 1: "#E31A1C"}
     names = {0: "real", 1: "fake"}
     panels = [
-        ("l2_first_order", r"$\|F_0^k-F_0^{k+1}\|_2 / \Delta s_k$", "First-order L2 scale dynamics"),
-        ("cosine_distance_first_order", r"$(1-\cos(F_0^k,F_0^{k+1})) / \Delta s_k$", "First-order cosine-distance scale dynamics"),
+        ("l2_first_order", r"$\operatorname{dis}(F_0^k,F_0^{k+1}) / \Delta s_k$", "L2 first-order feature"),
+        ("cosine_similarity_first_order", r"$\operatorname{sim}(F_0^k,F_0^{k+1}) / \Delta s_k$", "Cosine first-order feature"),
+        ("cosine_distance_first_order", r"$(1-\operatorname{sim}(F_0^k,F_0^{k+1})) / \Delta s_k$", "Cosine-distance change"),
     ]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14.0, 4.9), sharex=True)
+    fig, axes = plt.subplots(1, 3, figsize=(19.0, 4.9), sharex=True)
     for ax, (key, ylabel, title) in zip(axes, panels):
         values = first_order[key]
         for label in [0, 1]:
