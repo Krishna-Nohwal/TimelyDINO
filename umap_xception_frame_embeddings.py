@@ -138,8 +138,20 @@ def cap_items(items: list[dict], cap: int, seed: int):
     if cap <= 0 or len(items) <= cap:
         return items
     rng = np.random.default_rng(seed)
-    idx = rng.choice(len(items), size=cap, replace=False)
-    return [items[int(i)] for i in sorted(idx)]
+    reals = [item for item in items if item["label"] == 0]
+    fakes = [item for item in items if item["label"] == 1]
+    if not reals or not fakes:
+        idx = rng.choice(len(items), size=cap, replace=False)
+        return [items[int(i)] for i in sorted(idx)]
+
+    n_real = min(len(reals), cap // 2)
+    n_fake = min(len(fakes), cap - n_real)
+    n_real = min(len(reals), cap - n_fake)
+    real_idx = rng.choice(len(reals), size=n_real, replace=False)
+    fake_idx = rng.choice(len(fakes), size=n_fake, replace=False)
+    capped = [reals[int(i)] for i in real_idx] + [fakes[int(i)] for i in fake_idx]
+    order = rng.permutation(len(capped))
+    return [capped[int(i)] for i in order]
 
 
 def video_id_from_ffpp_sample(sample_dir: str) -> str:
@@ -443,7 +455,10 @@ def load_model(checkpoint: str, model_name_override: str, device: torch.device):
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    raw = torch.load(ckpt_path, map_location="cpu")
+    try:
+        raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        raw = torch.load(ckpt_path, map_location="cpu")
     checkpoint_model_name = raw.get("model_name", "xception") if isinstance(raw, dict) else "xception"
     model_name = model_name_override or checkpoint_model_name
     model = build_xception(model_name)
