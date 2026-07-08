@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image, ImageOps
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
@@ -556,6 +557,30 @@ def print_frame_counts(title: str, labels: np.ndarray, dataset_tags: List[str]):
     print(f"  {'TOTAL':<10} {len(labels):>5} {int((labels == 0).sum()):>6} {int((labels == 1).sum()):>6}")
 
 
+def print_sampled_auc(title: str, labels: np.ndarray, probs: np.ndarray, dataset_tags: List[str]):
+    tags = np.asarray(dataset_tags)
+    print(f"\n{title}")
+    print("  dataset      n   real   fake      AUC       AP")
+    print("  -----------------------------------------------")
+
+    def row(name: str, mask: np.ndarray):
+        n = int(mask.sum())
+        real_n = int(((labels == 0) & mask).sum())
+        fake_n = int(((labels == 1) & mask).sum())
+        if n == 0:
+            return
+        if real_n == 0 or fake_n == 0:
+            print(f"  {name:<10} {n:>5} {real_n:>6} {fake_n:>6}      nan      nan  (single class)")
+            return
+        auc = roc_auc_score(labels[mask], probs[mask])
+        ap = average_precision_score(labels[mask], probs[mask])
+        print(f"  {name:<10} {n:>5} {real_n:>6} {fake_n:>6}  {auc:>7.4f}  {ap:>7.4f}")
+
+    for dset in sorted(set(tags.tolist())):
+        row(dset, tags == dset)
+    row("ALL", np.ones(len(labels), dtype=bool))
+
+
 def outlier_group_keys(labels: np.ndarray, dataset_tags: List[str], mode: str):
     tags = np.asarray(dataset_tags)
     if mode == "class":
@@ -731,6 +756,7 @@ def main():
         print(f"Cached embeddings -> {cache_path}")
 
     print_frame_counts("Frames before outlier removal:", labels, dataset_tags)
+    print_sampled_auc("Frame-level performance on sampled frames:", labels, probs, dataset_tags)
     embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags = remove_outliers(
         embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags,
         args.outlier_std, args.outlier_group,
