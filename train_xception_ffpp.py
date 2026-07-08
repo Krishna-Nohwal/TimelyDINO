@@ -1,5 +1,5 @@
 """
-Train a pretrained Xception frame classifier on FaceForensics++ frames.
+Train a pretrained Xception frame classifier on FF++ plus extra datasets.
 
 Expected FF++ layout:
     <root_dir>/<sample_dir>/image.png
@@ -14,6 +14,16 @@ Example:
 python train_xception_ffpp.py \
     --manifest /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/manifest_ff_onct.csv \
     --root_dir /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out \
+    --cdfv2_fake_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2 \
+    --cdfv2_real_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real \
+    --df0_fake_root /media/tarun/B482367C823642E2/usr/df1.0_faces/fake \
+    --df0_real_root /media/tarun/B482367C823642E2/usr/df1.0_faces/real \
+    --dfdc_fake_root /media/tarun/B482367C823642E2/usr/dfdc/fake \
+    --dfdc_real_root /media/tarun/B482367C823642E2/usr/dfdc/real \
+    --wdf_fake_root /media/tarun/B482367C823642E2/usr/wdf/test/fake \
+    --wdf_real_root /media/tarun/B482367C823642E2/usr/wdf/test/real \
+    --uadfv_fake_root /media/tarun/B482367C823642E2/usr/uadfv_faces/fake \
+    --uadfv_real_root /media/tarun/B482367C823642E2/usr/uadfv_faces/real \
     --save_dir checkpoints_xception_ffpp \
     --epochs 10 \
     --batch_size 64
@@ -39,7 +49,7 @@ from tqdm import tqdm
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train pretrained Xception on FF++ frames.")
+    p = argparse.ArgumentParser(description="Train pretrained Xception on FF++ plus optional extra datasets.")
     p.add_argument("--manifest", required=True, help="FF++ manifest CSV with sample_dir,label.")
     p.add_argument("--root_dir", required=True, help="FF++ preprocessed frame root.")
     p.add_argument("--save_dir", default="checkpoints_xception_ffpp")
@@ -52,9 +62,28 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--val_ratio", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--frames_per_video", type=int, default=0, help="0 = use all frames from every selected video.")
     p.add_argument("--max_train_frames", type=int, default=0, help="0 = no cap.")
     p.add_argument("--max_val_frames", type=int, default=0, help="0 = no cap.")
     p.add_argument("--no_amp", action="store_true")
+
+    # CDFv2
+    p.add_argument("--cdfv2_fake_root", default="")
+    p.add_argument("--cdfv2_real_root", default="")
+
+    # UADFV / DFo nested layouts: <root>/<video>/<frame>/image.png
+    p.add_argument("--uadfv_fake_root", default="")
+    p.add_argument("--uadfv_real_root", default="")
+    p.add_argument("--df0_fake_root", default="")
+    p.add_argument("--df0_real_root", default="")
+    p.add_argument("--dfo_fake_root", default="")
+    p.add_argument("--dfo_real_root", default="")
+
+    # DFDC / WDF flat layouts: <root>/<video_id>_<frame>.png
+    p.add_argument("--dfdc_fake_root", default="")
+    p.add_argument("--dfdc_real_root", default="")
+    p.add_argument("--wdf_fake_root", default="")
+    p.add_argument("--wdf_real_root", default="")
     return p.parse_args()
 
 
@@ -72,7 +101,21 @@ def video_id_from_sample_dir(sample_dir: str) -> str:
     return f"{prefix}/{clip_id}" if prefix else clip_id
 
 
-def prepare_video_split(manifest: str, root_dir: str, val_ratio: float, seed: int):
+def sample_frame_paths(paths: list[str], frames_per_video: int) -> list[str]:
+    if frames_per_video <= 0 or len(paths) <= frames_per_video:
+        return paths
+    indices = np.linspace(0, len(paths) - 1, frames_per_video, dtype=int)
+    return [paths[int(i)] for i in indices]
+
+
+def print_video_counts(name: str, videos: list[tuple[str, list[str], int]]):
+    real_n = sum(1 for _, _, label in videos if label == 0)
+    fake_n = sum(1 for _, _, label in videos if label == 1)
+    frame_n = sum(len(paths) for _, paths, _ in videos)
+    print(f"  [{name}] videos={len(videos)}  frames={frame_n}  real_videos={real_n}  fake_videos={fake_n}")
+
+
+def build_ffpp_videos(manifest: str, root_dir: str):
     df = pd.read_csv(manifest)
     required = {"sample_dir", "label"}
     if not required.issubset(df.columns):
@@ -81,40 +124,204 @@ def prepare_video_split(manifest: str, root_dir: str, val_ratio: float, seed: in
     df = df.copy()
     df["label"] = df["label"].astype(int)
     df["video_id"] = df["sample_dir"].apply(video_id_from_sample_dir)
-
-    rng = np.random.default_rng(seed)
-    real_vids = rng.permutation(df[df["label"] == 0]["video_id"].unique())
-    fake_vids = rng.permutation(df[df["label"] == 1]["video_id"].unique())
-
-    real_val_n = max(1, int(len(real_vids) * val_ratio))
-    fake_val_n = max(1, int(len(fake_vids) * val_ratio))
-    val_ids = set(real_vids[:real_val_n]) | set(fake_vids[:fake_val_n])
-
-    train_df = df[~df["video_id"].isin(val_ids)].reset_index(drop=True)
-    val_df = df[df["video_id"].isin(val_ids)].reset_index(drop=True)
-
     root = Path(root_dir)
-    train_df["path"] = train_df["sample_dir"].astype(str).str.replace("\\", "/", regex=False).apply(
-        lambda rel: str(root / rel / "image.png")
-    )
-    val_df["path"] = val_df["sample_dir"].astype(str).str.replace("\\", "/", regex=False).apply(
-        lambda rel: str(root / rel / "image.png")
-    )
 
-    train_df = train_df[train_df["path"].apply(os.path.exists)].reset_index(drop=True)
-    val_df = val_df[val_df["path"].apply(os.path.exists)].reset_index(drop=True)
+    videos = []
+    for video_id, group in df.groupby("video_id"):
+        label = int(group["label"].iloc[0])
+        paths = []
+        for rel in group["sample_dir"].astype(str).str.replace("\\", "/", regex=False):
+            path = root / rel / "image.png"
+            if path.is_file():
+                paths.append(str(path))
+        if paths:
+            videos.append((str(video_id), sorted(paths), label))
+    print_video_counts("FFPP", videos)
+    return videos
 
-    print("FF++ split:")
+
+def video_id_from_sample(sample_name: str) -> str:
+    return re.sub(r"_(?:frame_|f)\d+$", "", sample_name)
+
+
+def build_cdfv2_videos(fake_root: str, real_root: str):
+    vid2paths, vid2label = {}, {}
+    for root_str, label in [(fake_root, 1), (real_root, 0)]:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"  [CDFv2] WARNING: missing root {root}")
+            continue
+        for d in sorted(root.iterdir()):
+            path = d / "image.png"
+            if d.is_dir() and path.exists():
+                vid = video_id_from_sample(d.name)
+                vid2paths.setdefault(vid, []).append(str(path))
+                vid2label[vid] = label
+    videos = [(vid, sorted(paths), vid2label[vid]) for vid, paths in sorted(vid2paths.items())]
+    print_video_counts("CDFv2", videos)
+    return videos
+
+
+def sort_nested_frame_paths(paths: list[Path]) -> list[str]:
+    def key_fn(path: Path):
+        parent = path.parent.name
+        if parent.isdigit():
+            return int(parent), str(path)
+        return 10**12, str(path)
+    return [str(path) for path in sorted(paths, key=key_fn)]
+
+
+def build_nested_image_videos(fake_root: str, real_root: str, dataset_name: str):
+    videos = []
+    for root_str, label in [(fake_root, 1), (real_root, 0)]:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"  [{dataset_name}] WARNING: missing root {root}")
+            continue
+        for video_dir in sorted(d for d in root.iterdir() if d.is_dir()):
+            paths = sort_nested_frame_paths(list(video_dir.rglob("image.png")))
+            if paths:
+                videos.append((video_dir.name, paths, label))
+    print_video_counts(dataset_name, videos)
+    return videos
+
+
+FLAT_FRAME_RE = re.compile(r"^(.+)_(\d+)\.(png|jpg|jpeg)$", re.IGNORECASE)
+
+
+def build_flat_videos(fake_root: str, real_root: str, dataset_name: str):
+    videos = []
+    for root_str, label in [(fake_root, 1), (real_root, 0)]:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"  [{dataset_name}] WARNING: missing root {root}")
+            continue
+        grouped = {}
+        skipped = 0
+        for path in sorted(root.iterdir()):
+            if not path.is_file():
+                continue
+            match = FLAT_FRAME_RE.match(path.name)
+            if not match:
+                skipped += 1
+                continue
+            video_id, frame_idx = match.group(1), int(match.group(2))
+            grouped.setdefault(video_id, []).append((frame_idx, str(path)))
+        if skipped:
+            print(f"  [{dataset_name}] skipped {skipped} files under {root}")
+        for video_id, indexed_paths in sorted(grouped.items()):
+            paths = [p for _, p in sorted(indexed_paths)]
+            if paths:
+                videos.append((video_id, paths, label))
+    print_video_counts(dataset_name, videos)
+    return videos
+
+
+def split_videos(videos: list[tuple[str, list[str], int]], val_ratio: float, seed: int):
+    rng = np.random.default_rng(seed)
+    train, val = [], []
+    for label in sorted(set(label for _, _, label in videos)):
+        class_videos = [v for v in videos if v[2] == label]
+        if not class_videos:
+            continue
+        order = rng.permutation(len(class_videos))
+        class_videos = [class_videos[int(i)] for i in order]
+        val_n = max(1, int(len(class_videos) * val_ratio)) if val_ratio > 0 and len(class_videos) > 1 else 0
+        val.extend(class_videos[:val_n])
+        train.extend(class_videos[val_n:])
+    return train, val
+
+
+def videos_to_df(videos: list[tuple[str, list[str], int]], dataset_name: str, frames_per_video: int):
+    rows = []
+    for video_id, paths, label in videos:
+        for path in sample_frame_paths(paths, frames_per_video):
+            rows.append({
+                "path": path,
+                "label": int(label),
+                "dataset": dataset_name,
+                "video_id": video_id,
+            })
+    return pd.DataFrame(rows)
+
+
+def build_all_videos(args):
+    dataset_videos = {}
+    print("\nBuilding dataset video lists ...")
+    dataset_videos["FFPP"] = build_ffpp_videos(args.manifest, args.root_dir)
+
+    if args.cdfv2_fake_root and args.cdfv2_real_root:
+        dataset_videos["CDFv2"] = build_cdfv2_videos(args.cdfv2_fake_root, args.cdfv2_real_root)
+    else:
+        print("  [skip] CDFv2 roots not provided.")
+
+    dfo_fake = args.dfo_fake_root or args.df0_fake_root
+    dfo_real = args.dfo_real_root or args.df0_real_root
+    if dfo_fake and dfo_real:
+        dataset_videos["DFo"] = build_nested_image_videos(dfo_fake, dfo_real, "DFo")
+    else:
+        print("  [skip] DFo roots not provided.")
+
+    if args.uadfv_fake_root and args.uadfv_real_root:
+        dataset_videos["UADFV"] = build_nested_image_videos(args.uadfv_fake_root, args.uadfv_real_root, "UADFV")
+    else:
+        print("  [skip] UADFV roots not provided.")
+
+    if args.dfdc_fake_root and args.dfdc_real_root:
+        dataset_videos["DFDC"] = build_flat_videos(args.dfdc_fake_root, args.dfdc_real_root, "DFDC")
+    else:
+        print("  [skip] DFDC roots not provided.")
+
+    if args.wdf_fake_root and args.wdf_real_root:
+        dataset_videos["WDF"] = build_flat_videos(args.wdf_fake_root, args.wdf_real_root, "WDF")
+    else:
+        print("  [skip] WDF roots not provided.")
+
+    return {name: videos for name, videos in dataset_videos.items() if videos}
+
+
+def prepare_video_split(args):
+    dataset_videos = build_all_videos(args)
+    train_dfs, val_dfs = [], []
+    print("\nVideo-level train/val splits:")
+    for offset, (dataset_name, videos) in enumerate(sorted(dataset_videos.items()), start=100):
+        train_videos, val_videos = split_videos(videos, args.val_ratio, args.seed + offset)
+        train_df = videos_to_df(train_videos, dataset_name, args.frames_per_video)
+        val_df = videos_to_df(val_videos, dataset_name, args.frames_per_video)
+        train_dfs.append(train_df)
+        val_dfs.append(val_df)
+        print(
+            f"  {dataset_name:<6} train_videos={len(train_videos):>5} val_videos={len(val_videos):>4} "
+            f"train_frames={len(train_df):>7} val_frames={len(val_df):>6}"
+        )
+
+    if not train_dfs or not val_dfs:
+        raise ValueError("No train/val data found.")
+
+    train_df = pd.concat(train_dfs, ignore_index=True).sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+    val_df = pd.concat(val_dfs, ignore_index=True).sample(frac=1.0, random_state=args.seed + 1).reset_index(drop=True)
+
+    print("\nCombined split:")
     print(f"  train frames: {len(train_df)}  real={(train_df['label'] == 0).sum()}  fake={(train_df['label'] == 1).sum()}")
     print(f"  val frames  : {len(val_df)}  real={(val_df['label'] == 0).sum()}  fake={(val_df['label'] == 1).sum()}")
-    print(f"  train videos: {train_df['video_id'].nunique()}  val videos: {val_df['video_id'].nunique()}")
     return train_df, val_df
 
 
 def cap_df(df: pd.DataFrame, cap: int, seed: int) -> pd.DataFrame:
     if cap <= 0 or len(df) <= cap:
         return df
-    return df.sample(n=cap, random_state=seed).reset_index(drop=True)
+    reals = df[df["label"] == 0]
+    fakes = df[df["label"] == 1]
+    if reals.empty or fakes.empty:
+        return df.sample(n=cap, random_state=seed).reset_index(drop=True)
+    n_real = min(len(reals), cap // 2)
+    n_fake = min(len(fakes), cap - n_real)
+    n_real = min(len(reals), cap - n_fake)
+    capped = pd.concat([
+        reals.sample(n=n_real, random_state=seed),
+        fakes.sample(n=n_fake, random_state=seed + 1),
+    ])
+    return capped.sample(frac=1.0, random_state=seed + 2).reset_index(drop=True)
 
 
 class FrameDataset(Dataset):
@@ -191,9 +398,14 @@ def evaluate(model, loader, device, amp_enabled: bool, name: str):
     probs_np = np.asarray(probs_all, dtype=np.float64)
     preds_np = (probs_np >= 0.5).astype(np.int64)
 
+    acc = accuracy_score(labels_np, preds_np)
+    if len(np.unique(labels_np)) < 2:
+        auc = float("nan")
+        ap = float("nan")
+        print(f"  [{name}] AUC=nan  AP=nan  Acc={acc * 100:.2f}%  (single class)")
+        return auc, ap, acc
     auc = roc_auc_score(labels_np, probs_np)
     ap = average_precision_score(labels_np, probs_np)
-    acc = accuracy_score(labels_np, preds_np)
     print(f"  [{name}] AUC={auc:.4f}  AP={ap:.4f}  Acc={acc * 100:.2f}%")
     return auc, ap, acc
 
@@ -237,7 +449,7 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("Train pretrained Xception on FF++")
+    print("Train pretrained Xception on FF++ + extra datasets")
     print("=" * 88)
     print(f"Device      : {device}")
     print(f"AMP enabled : {amp_enabled}")
@@ -246,9 +458,12 @@ def main():
     print(f"Root        : {args.root_dir}")
     print(f"Save dir    : {save_dir}")
 
-    train_df, val_df = prepare_video_split(args.manifest, args.root_dir, args.val_ratio, args.seed)
+    train_df, val_df = prepare_video_split(args)
     train_df = cap_df(train_df, args.max_train_frames, args.seed)
     val_df = cap_df(val_df, args.max_val_frames, args.seed + 1)
+    print("\nAfter optional frame caps:")
+    print(f"  train frames: {len(train_df)}  real={(train_df['label'] == 0).sum()}  fake={(train_df['label'] == 1).sum()}")
+    print(f"  val frames  : {len(val_df)}  real={(val_df['label'] == 0).sum()}  fake={(val_df['label'] == 1).sum()}")
 
     train_set = FrameDataset(train_df, args.image_size, train=True)
     val_set = FrameDataset(val_df, args.image_size, train=False)
@@ -288,7 +503,7 @@ def main():
         loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, amp_enabled, epoch)
         print(f"  mean train loss: {loss:.4f}")
 
-        val_auc, val_ap, val_acc = evaluate(model, val_loader, device, amp_enabled, "FF++ Val")
+        val_auc, val_ap, val_acc = evaluate(model, val_loader, device, amp_enabled, "Combined Val")
         scheduler.step()
 
         state = {
