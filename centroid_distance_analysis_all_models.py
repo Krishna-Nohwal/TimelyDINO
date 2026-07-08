@@ -203,7 +203,12 @@ def load_cache(path: Path, expected_metadata: dict):
     except Exception:
         return None
     for key, value in expected_metadata.items():
-        if metadata.get(key) != value:
+        observed = metadata.get(key)
+        if observed is None and key == "model_name_override" and value == "":
+            observed = ""
+        if observed is None and key == "no_amp" and value is False:
+            observed = False
+        if observed != value:
             print(f"  cache mismatch for {path.name}: {key} differs")
             return None
     print(f"  loaded cache: {path}")
@@ -352,7 +357,10 @@ def compute_rows_for_space(
             n = int(mask.sum())
             add_row(rows, model_info, "video_count_dataset_class", space, class_name, value=n, dataset=dset, n=n)
             if n >= min_videos:
-                centroids[dset] = x[mask].mean(axis=0)
+                centroid = x[mask].mean(axis=0, keepdims=True)
+                if space == "cosine_normalized":
+                    centroid = l2_normalize(centroid)
+                centroids[dset] = centroid.reshape(-1)
                 counts[dset] = n
                 dists = distance_matrix(x[mask], centroids[dset][None, :], space).reshape(-1)
                 add_row(
@@ -370,6 +378,7 @@ def compute_rows_for_space(
             continue
 
         pair_distances = []
+        pair_weights = []
         centroid_names = sorted(centroids)
         centroid_mat = np.stack([centroids[name] for name in centroid_names], axis=0)
         centroid_dist = distance_matrix(centroid_mat, centroid_mat, space)
@@ -378,18 +387,25 @@ def compute_rows_for_space(
                 dset_b = centroid_names[j]
                 dist = float(centroid_dist[i, j])
                 pair_distances.append(dist)
+                pair_weights.append(counts[dset_a] * counts[dset_b])
                 add_row(
                     rows, model_info, "pairwise_centroid_distance", space, class_name,
                     value=dist, dataset_a=dset_a, dataset_b=dset_b,
                     n_a=counts[dset_a], n_b=counts[dset_b],
-                    note="Distance between dataset centroids within the same class.",
+                    note="Distance between dataset centroids within the same class. Cosine centroids are renormalized after averaging.",
                 )
 
         pair_distances = np.asarray(pair_distances, dtype=np.float64)
+        pair_weights = np.asarray(pair_weights, dtype=np.float64)
         add_row(
             rows, model_info, "mean_pairwise_centroid_distance", space, class_name,
             value=float(pair_distances.mean()), dataset="ALL", n=int(class_mask.sum()),
-            note="Lower value means dataset centroids for this class are more aligned.",
+            note="Unweighted mean over dataset pairs. Lower value means dataset centroids for this class are more aligned.",
+        )
+        add_row(
+            rows, model_info, "weighted_mean_pairwise_centroid_distance", space, class_name,
+            value=float(np.average(pair_distances, weights=pair_weights)), dataset="ALL", n=int(class_mask.sum()),
+            note="Mean over dataset pairs weighted by n_a*n_b. Lower value means dataset centroids for this class are more aligned.",
         )
         add_row(
             rows, model_info, "std_pairwise_centroid_distance", space, class_name,
@@ -413,12 +429,42 @@ def compute_rows_for_space(
         add_row(
             rows, model_info, "nearest_dataset_centroid_accuracy", space, class_name,
             value=centroid_acc, dataset="ALL", n=int(len(label_class)),
-            note="Higher value means video embeddings are more dataset-identifiable within this class.",
+            note="Self-inclusive nearest-centroid accuracy. Higher value means video embeddings are more dataset-identifiable within this class.",
         )
         add_row(
             rows, model_info, "mean_dataset_centroid_margin", space, class_name,
             value=float(np.mean(margin)), dataset="ALL", n=int(len(label_class)),
-            note="Nearest other dataset centroid distance minus own centroid distance.",
+            note="Self-inclusive nearest other dataset centroid distance minus own centroid distance.",
+        )
+
+        dataset_sums = {name: x[class_mask & (tags == name)].sum(axis=0) for name in centroid_names}
+        loo_dist = dist_to_centroids.copy()
+        for row_idx, dset in enumerate(tag_class):
+            count = counts[dset]
+            if count <= 1:
+                continue
+            own_centroid = (dataset_sums[dset] - x_class[row_idx]) / float(count - 1)
+            if space == "cosine_normalized":
+                own_centroid = l2_normalize(own_centroid[None, :]).reshape(-1)
+            loo_dist[row_idx, centroid_names.index(dset)] = distance_matrix(
+                x_class[row_idx][None, :], own_centroid[None, :], space
+            )[0, 0]
+        loo_nearest_idx = loo_dist.argmin(axis=1)
+        loo_nearest_dataset = np.asarray([centroid_names[i] for i in loo_nearest_idx])
+        loo_acc = float((loo_nearest_dataset == tag_class).mean()) if len(tag_class) else np.nan
+        loo_own_dist = loo_dist[np.arange(len(tag_class)), own_idx]
+        loo_other_dist = loo_dist.copy()
+        loo_other_dist[np.arange(len(tag_class)), own_idx] = np.inf
+        loo_margin = loo_other_dist.min(axis=1) - loo_own_dist
+        add_row(
+            rows, model_info, "nearest_dataset_centroid_accuracy_leave_one_out", space, class_name,
+            value=loo_acc, dataset="ALL", n=int(len(label_class)),
+            note="Nearest-centroid accuracy where a video's own dataset centroid excludes that video.",
+        )
+        add_row(
+            rows, model_info, "mean_dataset_centroid_margin_leave_one_out", space, class_name,
+            value=float(np.mean(loo_margin)), dataset="ALL", n=int(len(label_class)),
+            note="Nearest other dataset centroid distance minus leave-one-out own centroid distance.",
         )
 
 
@@ -431,7 +477,14 @@ def compute_findings(model_info: dict, video_arrays: tuple, min_videos: int) -> 
     # Convenient high-level fake-vs-real ratios for the two summary metrics.
     df = pd.DataFrame(rows)
     for space in ("cosine_normalized", "zscore_l2"):
-        for metric in ("mean_pairwise_centroid_distance", "nearest_dataset_centroid_accuracy", "mean_dataset_centroid_margin"):
+        for metric in (
+            "mean_pairwise_centroid_distance",
+            "weighted_mean_pairwise_centroid_distance",
+            "nearest_dataset_centroid_accuracy",
+            "nearest_dataset_centroid_accuracy_leave_one_out",
+            "mean_dataset_centroid_margin",
+            "mean_dataset_centroid_margin_leave_one_out",
+        ):
             sub = df[(df["space"] == space) & (df["metric"] == metric) & (df["dataset"] == "ALL")]
             values = {row["class"]: row["value"] for _, row in sub.iterrows()}
             real = values.get("real", np.nan)
@@ -451,6 +504,57 @@ def compute_findings(model_info: dict, video_arrays: tuple, min_videos: int) -> 
     return rows
 
 
+def build_readable_summary(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for (model_key, space), group in df.groupby(["model_key", "space"], sort=True):
+        row = {"model": model_key, "space": space}
+        for metric, prefix in [
+            ("mean_pairwise_centroid_distance", "centroid_distance"),
+            ("weighted_mean_pairwise_centroid_distance", "weighted_centroid_distance"),
+            ("nearest_dataset_centroid_accuracy_leave_one_out", "dataset_predictability_loo"),
+            ("mean_dataset_centroid_margin_leave_one_out", "dataset_margin_loo"),
+        ]:
+            sub = group[(group["metric"] == metric) & (group["dataset"] == "ALL")]
+            values = {r["class"]: r["value"] for _, r in sub.iterrows()}
+            real = values.get("real", np.nan)
+            fake = values.get("fake", np.nan)
+            row[f"real_{prefix}"] = real
+            row[f"fake_{prefix}"] = fake
+            row[f"fake_minus_real_{prefix}"] = fake - real if pd.notna(real) and pd.notna(fake) else np.nan
+            row[f"fake_over_real_{prefix}"] = fake / real if pd.notna(real) and pd.notna(fake) and abs(real) > 1e-12 else np.nan
+
+        within = group[group["metric"] == "mean_within_centroid_distance"]
+        for class_name in ("real", "fake"):
+            vals = within[within["class"] == class_name]["value"].astype(float)
+            row[f"{class_name}_avg_within_dataset_dispersion"] = vals.mean() if len(vals) else np.nan
+        row["fake_minus_real_within_dataset_dispersion"] = (
+            row["fake_avg_within_dataset_dispersion"] - row["real_avg_within_dataset_dispersion"]
+        )
+        row["supports_fake_more_dispersed_unweighted"] = bool(row["fake_minus_real_centroid_distance"] > 0)
+        row["supports_fake_more_dispersed_weighted"] = bool(row["fake_minus_real_weighted_centroid_distance"] > 0)
+        row["supports_fake_more_dataset_predictable_loo"] = bool(row["fake_minus_real_dataset_predictability_loo"] > 0)
+        row["quick_read"] = (
+            "supports dispersion" if row["fake_minus_real_centroid_distance"] > 0 else "does not support dispersion"
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_pairwise_table(df: pd.DataFrame) -> pd.DataFrame:
+    pairwise = df[df["metric"] == "pairwise_centroid_distance"].copy()
+    cols = ["model_key", "space", "class", "dataset_a", "dataset_b", "n_a", "n_b", "value"]
+    pairwise = pairwise[cols].rename(columns={"model_key": "model", "value": "centroid_distance"})
+    return pairwise.sort_values(["model", "space", "class", "dataset_a", "dataset_b"], kind="stable")
+
+
+def build_counts_table(df: pd.DataFrame) -> pd.DataFrame:
+    counts = df[df["metric"] == "video_count_dataset_class"].copy()
+    counts = counts[["model_key", "class", "dataset", "value"]].drop_duplicates().rename(
+        columns={"model_key": "model", "value": "n_videos"}
+    )
+    return counts.sort_values(["model", "class", "dataset"], kind="stable")
+
+
 def model_configs(args):
     return [
         {
@@ -458,6 +562,7 @@ def model_configs(args):
             "checkpoint": args.xception_checkpoint,
             "image_size": args.xception_image_size,
             "feature_source": "penultimate",
+            "model_name_override": args.xception_model_name,
             "extract": lambda items, device: extract_timm_like(
                 "xception", items, args.xception_image_size,
                 xception_umap.load_model, xception_umap.extract_embeddings,
@@ -469,6 +574,7 @@ def model_configs(args):
             "checkpoint": args.effnet_checkpoint,
             "image_size": args.effnet_image_size,
             "feature_source": "penultimate",
+            "model_name_override": args.effnet_model_name,
             "extract": lambda items, device: extract_timm_like(
                 "efficientnet", items, args.effnet_image_size,
                 effnet_umap.load_model, xception_umap.extract_embeddings,
@@ -480,6 +586,7 @@ def model_configs(args):
             "checkpoint": args.clip_checkpoint,
             "image_size": args.clip_image_size,
             "feature_source": "pre_logits",
+            "model_name_override": args.clip_model_name,
             "extract": lambda items, device: extract_timm_like(
                 "clip_vit_b16", items, args.clip_image_size,
                 clip_umap.load_model, clip_umap.extract_embeddings,
@@ -491,6 +598,7 @@ def model_configs(args):
             "checkpoint": args.stage1_checkpoint,
             "image_size": args.stage1_image_size,
             "feature_source": args.stage1_feature_source,
+            "model_name_override": "",
             "extract": lambda items, device: extract_stage1(
                 items, args.stage1_image_size, args.stage1_checkpoint, device, args,
             ),
@@ -547,6 +655,8 @@ def main():
             "items_signature": shared_sig,
             "image_size": int(config["image_size"]),
             "feature_source": str(config["feature_source"]),
+            "model_name_override": str(config.get("model_name_override", "")),
+            "no_amp": bool(args.no_amp),
         }
         cache_path = cache_dir / f"{safe_key(model_key)}_{safe_key(ckpt.stem)}_frame_embeddings.npz"
         cached = None if args.refresh_cache else load_cache(cache_path, metadata)
@@ -588,13 +698,21 @@ def main():
     sort_cols = ["model_key", "space", "metric", "class", "dataset", "dataset_a", "dataset_b"]
     df = df.sort_values(sort_cols, kind="stable")
     df.to_csv(out_path, index=False)
+    summary_path = out_path.with_name(f"{out_path.stem}_summary.csv")
+    pairwise_path = out_path.with_name(f"{out_path.stem}_pairwise.csv")
+    counts_path = out_path.with_name(f"{out_path.stem}_counts.csv")
+    readable = build_readable_summary(df)
+    readable.to_csv(summary_path, index=False)
+    build_pairwise_table(df).to_csv(pairwise_path, index=False)
+    build_counts_table(df).to_csv(counts_path, index=False)
 
     summary = df[
         df["metric"].isin([
             "fake_minus_real_mean_pairwise_centroid_distance",
+            "fake_minus_real_weighted_mean_pairwise_centroid_distance",
             "fake_over_real_mean_pairwise_centroid_distance",
-            "fake_minus_real_nearest_dataset_centroid_accuracy",
-            "fake_minus_real_mean_dataset_centroid_margin",
+            "fake_minus_real_nearest_dataset_centroid_accuracy_leave_one_out",
+            "fake_minus_real_mean_dataset_centroid_margin_leave_one_out",
         ])
     ][["model_key", "space", "metric", "value"]]
 
@@ -605,6 +723,9 @@ def main():
         print("  No summary rows available.")
     print("\nSaved:")
     print(f"  {out_path}")
+    print(f"  {summary_path}")
+    print(f"  {pairwise_path}")
+    print(f"  {counts_path}")
     print("=" * 88)
 
 
