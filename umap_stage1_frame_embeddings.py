@@ -1,8 +1,9 @@
 """
-UMAP for Stage-1 frame-level embeddings across evaluation datasets.
+UMAP for Stage-1 video-level embeddings across evaluation datasets.
 
 This script runs frame_model.ViT directly, extracts one embedding per sampled
-frame, and plots the resulting frame-level representation space. It uses the
+frame, mean-pools sampled frames per video, and plots the resulting video-level
+representation space. It uses the
 same dataset layouts as tsne_predictions1.py, but does not import that script
 so it stays standalone.
 
@@ -41,7 +42,6 @@ python umap_stage1_frame_embeddings.py \
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
 from collections import defaultdict
@@ -51,7 +51,7 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
+from sklearn.metrics import average_precision_score, roc_auc_score
 from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -60,7 +60,6 @@ from frame_model import ViT
 
 
 IMG_SIZE = 256
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -180,6 +179,30 @@ def print_dataset_counts(title: str, labels: np.ndarray, dataset_tags: List[str]
         fake_n = int(((labels == 1) & mask).sum())
         print(f"  {dset:<10} {int(mask.sum()):>5} {real_n:>6} {fake_n:>6}")
     print(f"  {'TOTAL':<10} {len(labels):>5} {int((labels == 0).sum()):>6} {int((labels == 1).sum()):>6}")
+
+
+def print_sampled_auc(title: str, labels: np.ndarray, probs: np.ndarray, dataset_tags: List[str]):
+    tags = np.asarray(dataset_tags)
+    print(f"\n{title}")
+    print("  dataset      n   real   fake      AUC       AP")
+    print("  -----------------------------------------------")
+
+    def row(name: str, mask: np.ndarray):
+        n = int(mask.sum())
+        real_n = int(((labels == 0) & mask).sum())
+        fake_n = int(((labels == 1) & mask).sum())
+        if n == 0:
+            return
+        if real_n == 0 or fake_n == 0:
+            print(f"  {name:<10} {n:>5} {real_n:>6} {fake_n:>6}      nan      nan  (single class)")
+            return
+        auc = roc_auc_score(labels[mask], probs[mask])
+        ap = average_precision_score(labels[mask], probs[mask])
+        print(f"  {name:<10} {n:>5} {real_n:>6} {fake_n:>6}  {auc:>7.4f}  {ap:>7.4f}")
+
+    for dset in sorted(set(tags.tolist())):
+        row(dset, tags == dset)
+    row("ALL", np.ones(len(labels), dtype=bool))
 
 
 def extract_video_id_ffpp(sample_dir: str) -> str:
@@ -533,6 +556,52 @@ def extract_frame_embeddings(model, loader, device: torch.device, args):
     )
 
 
+def aggregate_frames_to_videos(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    probs: np.ndarray,
+    paths: List[str],
+    dataset_tags: List[str],
+    video_ids: List[str],
+    frame_positions: np.ndarray,
+    ok_flags: np.ndarray,
+):
+    groups = defaultdict(list)
+    for idx, (dset, vid) in enumerate(zip(dataset_tags, video_ids)):
+        groups[(str(dset), str(vid))].append(idx)
+
+    out_embeddings, out_labels, out_probs = [], [], []
+    out_paths, out_datasets, out_video_ids, out_frame_counts, out_ok_flags = [], [], [], [], []
+    mixed_label_groups = 0
+    for (dset, vid), idxs in sorted(groups.items()):
+        idx = np.asarray(idxs, dtype=int)
+        group_labels = labels[idx].astype(int)
+        if len(set(group_labels.tolist())) > 1:
+            mixed_label_groups += 1
+        out_embeddings.append(embeddings[idx].mean(axis=0))
+        out_labels.append(int(np.round(group_labels.mean())))
+        out_probs.append(float(probs[idx].mean()))
+        out_paths.append(paths[int(idx[0])])
+        out_datasets.append(dset)
+        out_video_ids.append(vid)
+        out_frame_counts.append(int(len(idx)))
+        out_ok_flags.append(bool(ok_flags[idx].all()))
+
+    if mixed_label_groups:
+        print(f"WARNING: {mixed_label_groups} video groups contained mixed frame labels; using rounded mean label.")
+    print(f"\nAggregated frames -> videos: {len(labels)} frames -> {len(out_labels)} videos")
+    return (
+        np.stack(out_embeddings, axis=0),
+        np.asarray(out_labels, dtype=np.int64),
+        np.asarray(out_probs, dtype=np.float32),
+        out_paths,
+        out_datasets,
+        out_video_ids,
+        np.asarray(out_frame_counts, dtype=np.int64),
+        np.asarray(out_ok_flags, dtype=bool),
+    )
+
+
 def outlier_group_keys(labels: np.ndarray, dataset_tags: List[str], mode: str):
     tags = np.asarray(dataset_tags)
     if mode == "class":
@@ -633,7 +702,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray, dataset
         "WDF": "#000000",
         "UADFV": "#FFD700",
         "DFo": "#FF4FB3",
-        "DFD": "#7B2CBF",
+        "DFD": "#8B5A2B",
         "DFDC": "#FF8C00",
     }
     fallback_colors = plt.get_cmap("tab20").colors
@@ -651,7 +720,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray, dataset
                 c=colors[dset], marker=marker, s=7, alpha=0.78,
                 linewidths=0.05, edgecolors="black", label=f"{dset} - {name}",
             )
-    ax.set_title("UMAP of Stage-1 frame embeddings")
+    ax.set_title("UMAP of Stage-1 video embeddings")
     ax.set_xlabel("UMAP dim 1")
     ax.set_ylabel("UMAP dim 2")
     ax.legend(fontsize=7, loc="best", markerscale=1.4)
@@ -663,7 +732,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray, dataset
 
     split_path = output_with_suffix(out_path, "real_fake_split")
     fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.4))
-    for ax, label, title in [(axes[0], 0, "Real frames"), (axes[1], 1, "Fake frames")]:
+    for ax, label, title in [(axes[0], 0, "Real videos"), (axes[1], 1, "Fake videos")]:
         panel_mask = labels == label
         for dset in datasets:
             mask = panel_mask & (dataset_tags == dset)
@@ -679,7 +748,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray, dataset
         ax.set_ylabel("UMAP dim 2")
         ax.legend(fontsize=7, loc="best", markerscale=1.4)
         set_tight_limits(ax, coords[panel_mask])
-    fig.suptitle("Stage-1 frame embeddings split by class")
+    fig.suptitle("Stage-1 video embeddings split by class")
     fig.tight_layout()
     fig.savefig(split_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -693,7 +762,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray, dataset
             continue
         ax.scatter(coords[mask, 0], coords[mask, 1], c=color, marker=marker, s=7, alpha=0.78,
                    linewidths=0.05, edgecolors="black", label=name)
-    ax.set_title("UMAP of Stage-1 frame embeddings\ncolor = real/fake")
+    ax.set_title("UMAP of Stage-1 video embeddings\ncolor = real/fake")
     ax.set_xlabel("UMAP dim 1")
     ax.set_ylabel("UMAP dim 2")
     ax.legend(fontsize=9, loc="best")
@@ -709,7 +778,7 @@ def plot_umap(coords: np.ndarray, labels: np.ndarray, probs: np.ndarray, dataset
                     s=7, alpha=0.80, linewidths=0.05, edgecolors="black")
     cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Stage-1 P(fake), layer 23")
-    ax.set_title("UMAP of Stage-1 frame embeddings\ncolor = predicted P(fake)")
+    ax.set_title("UMAP of Stage-1 video embeddings\ncolor = predicted P(fake)")
     ax.set_xlabel("UMAP dim 1")
     ax.set_ylabel("UMAP dim 2")
     set_tight_limits(ax, coords)
@@ -740,7 +809,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
     print("=" * 88)
-    print("UMAP of Stage-1 frame-level embeddings")
+    print("UMAP of Stage-1 video-level embeddings")
     print("=" * 88)
     print(f"Device        : {device}")
     print(f"Feature source: {args.feature_source}")
@@ -791,7 +860,11 @@ def main():
         )
         print(f"Cached embeddings -> {cache_path}")
 
-    print_dataset_counts("Frames loaded before outlier removal:", labels, dataset_tags)
+    embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags = aggregate_frames_to_videos(
+        embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags
+    )
+    print_dataset_counts("Videos loaded before outlier removal:", labels, dataset_tags)
+    print_sampled_auc("Video-level performance from mean frame probabilities:", labels, probs, dataset_tags)
     embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags = remove_embedding_outliers(
         embeddings,
         labels,
@@ -804,7 +877,7 @@ def main():
         args.outlier_std,
         args.outlier_group,
     )
-    print_dataset_counts("Frames used for UMAP after outlier removal:", labels, dataset_tags)
+    print_dataset_counts("Videos used for UMAP after outlier removal:", labels, dataset_tags)
 
     from sklearn.preprocessing import StandardScaler
     patch_coverage_for_numba()
@@ -819,6 +892,11 @@ def main():
         ) from exc
 
     print("\nStandardizing embeddings and running joint UMAP ...")
+    if embeddings.shape[0] < 3:
+        raise ValueError(
+            f"Need at least 3 videos for UMAP after filtering, got {embeddings.shape[0]}. "
+            "Increase --frames_per_video / dataset caps or disable outlier removal with --outlier_std 0."
+        )
     scaled = StandardScaler().fit_transform(embeddings)
     n_neighbors = min(args.umap_neighbors, max(2, scaled.shape[0] - 1))
     reducer = umap.UMAP(
@@ -840,8 +918,8 @@ def main():
         "prob_fake": probs,
         "dataset": dataset_tags,
         "video_id": video_ids,
-        "frame_position": frame_positions,
-        "path": paths,
+        "n_frames": frame_positions,
+        "example_path": paths,
     }).to_csv(coords_path, index=False)
     saved.append(coords_path)
 

@@ -1,8 +1,9 @@
 """
-UMAP real/fake split for a trained CLIP ViT-B/16 frame model.
+UMAP real/fake split for a trained CLIP ViT-B/16 frame model, aggregated to videos.
 
 This loads checkpoints produced by train_clip_vit_b16_all.py, extracts a
-penultimate CLIP ViT frame embedding, and saves only a real-vs-fake split UMAP.
+penultimate CLIP ViT frame embedding, mean-pools embeddings per video, and saves
+only a real-vs-fake split UMAP.
 
 Example:
 python umap_clip_vit_b16_frame_embeddings.py \
@@ -39,6 +40,7 @@ from torch.utils.data import DataLoader
 
 from umap_xception_frame_embeddings import (
     FrameDataset,
+    aggregate_frames_to_videos,
     build_frame_items,
     default_embeddings_path,
     load_cached,
@@ -288,15 +290,18 @@ def main():
         )
         print(f"Cached embeddings -> {cache_path}")
 
-    print_frame_counts("Frames before outlier removal:", labels, dataset_tags)
-    print_sampled_auc("Frame-level performance on sampled frames:", labels, probs, dataset_tags)
+    embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags = aggregate_frames_to_videos(
+        embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags
+    )
+    print_frame_counts("Videos before outlier removal:", labels, dataset_tags)
+    print_sampled_auc("Video-level performance from mean frame probabilities:", labels, probs, dataset_tags)
     embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags = remove_outliers(
         embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags,
         args.outlier_std, args.outlier_group,
     )
-    print_frame_counts("Frames used for UMAP:", labels, dataset_tags)
+    print_frame_counts("Videos used for UMAP:", labels, dataset_tags)
     if embeddings.shape[0] < 3:
-        raise ValueError("Need at least 3 frames for UMAP after filtering.")
+        raise ValueError("Need at least 3 videos for UMAP after filtering.")
 
     from sklearn.preprocessing import StandardScaler
     patch_coverage_for_numba()
@@ -331,8 +336,8 @@ def main():
         "prob_fake": probs,
         "dataset": dataset_tags,
         "video_id": video_ids,
-        "frame_position": frame_positions,
-        "path": paths,
+        "n_frames": frame_positions,
+        "example_path": paths,
     }).to_csv(coords_path, index=False)
     print("\nSaved outputs:")
     print(f"  {args.out}")

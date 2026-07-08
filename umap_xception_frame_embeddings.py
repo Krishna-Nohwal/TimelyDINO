@@ -1,9 +1,9 @@
 """
-UMAP real/fake split for a pretrained Xception frame model.
+UMAP real/fake split for a pretrained Xception frame model, aggregated to videos.
 
 This loads checkpoints produced by train_xception_ffpp.py, extracts the
-penultimate Xception feature for sampled frames, and saves only a real-vs-fake
-split UMAP.
+penultimate Xception feature for sampled frames, mean-pools them per video, and
+saves only a real-vs-fake split UMAP.
 
 Example:
 python umap_xception_frame_embeddings.py \
@@ -581,6 +581,53 @@ def print_sampled_auc(title: str, labels: np.ndarray, probs: np.ndarray, dataset
     row("ALL", np.ones(len(labels), dtype=bool))
 
 
+def aggregate_frames_to_videos(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    probs: np.ndarray,
+    paths: List[str],
+    dataset_tags: List[str],
+    video_ids: List[str],
+    frame_positions: np.ndarray,
+    ok_flags: np.ndarray,
+):
+    groups = {}
+    for idx, (dset, vid) in enumerate(zip(dataset_tags, video_ids)):
+        groups.setdefault((str(dset), str(vid)), []).append(idx)
+
+    out_embeddings, out_labels, out_probs = [], [], []
+    out_paths, out_datasets, out_video_ids, out_frame_counts, out_ok_flags = [], [], [], [], []
+    mixed_label_groups = 0
+    for (dset, vid), idxs in sorted(groups.items()):
+        idx = np.asarray(idxs, dtype=int)
+        group_labels = labels[idx].astype(int)
+        if len(set(group_labels.tolist())) > 1:
+            mixed_label_groups += 1
+        label = int(np.round(group_labels.mean()))
+        out_embeddings.append(embeddings[idx].mean(axis=0))
+        out_probs.append(float(probs[idx].mean()))
+        out_labels.append(label)
+        out_paths.append(paths[int(idx[0])])
+        out_datasets.append(dset)
+        out_video_ids.append(vid)
+        out_frame_counts.append(int(len(idx)))
+        out_ok_flags.append(bool(ok_flags[idx].all()))
+
+    if mixed_label_groups:
+        print(f"WARNING: {mixed_label_groups} video groups contained mixed frame labels; using rounded mean label.")
+    print(f"\nAggregated frames -> videos: {len(labels)} frames -> {len(out_labels)} videos")
+    return (
+        np.stack(out_embeddings, axis=0),
+        np.asarray(out_labels, dtype=np.int64),
+        np.asarray(out_probs, dtype=np.float32),
+        out_paths,
+        out_datasets,
+        out_video_ids,
+        np.asarray(out_frame_counts, dtype=np.int64),
+        np.asarray(out_ok_flags, dtype=bool),
+    )
+
+
 def outlier_group_keys(labels: np.ndarray, dataset_tags: List[str], mode: str):
     tags = np.asarray(dataset_tags)
     if mode == "class":
@@ -662,14 +709,14 @@ def plot_real_fake_split(coords: np.ndarray, labels: np.ndarray, dataset_tags: L
         "WDF": "#000000",
         "UADFV": "#FFD700",
         "DFo": "#FF4FB3",
-        "DFD": "#7B2CBF",
+        "DFD": "#8B5A2B",
         "DFDC": "#FF8C00",
     }
     fallback = plt.get_cmap("tab20").colors
     colors = {d: base_colors.get(d, fallback[i % len(fallback)]) for i, d in enumerate(datasets)}
 
     fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.4))
-    for ax, label, title in [(axes[0], 0, "Real frames"), (axes[1], 1, "Fake frames")]:
+    for ax, label, title in [(axes[0], 0, "Real videos"), (axes[1], 1, "Fake videos")]:
         panel_mask = labels == label
         for dset in datasets:
             mask = panel_mask & (dataset_tags == dset)
@@ -685,7 +732,7 @@ def plot_real_fake_split(coords: np.ndarray, labels: np.ndarray, dataset_tags: L
         ax.set_ylabel("UMAP dim 2")
         ax.legend(fontsize=7, loc="best", markerscale=1.4)
         set_tight_limits(ax, coords[panel_mask])
-    fig.suptitle("Xception frame embeddings split by class")
+    fig.suptitle("Video embeddings split by class")
     fig.tight_layout()
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -755,15 +802,18 @@ def main():
         )
         print(f"Cached embeddings -> {cache_path}")
 
-    print_frame_counts("Frames before outlier removal:", labels, dataset_tags)
-    print_sampled_auc("Frame-level performance on sampled frames:", labels, probs, dataset_tags)
+    embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags = aggregate_frames_to_videos(
+        embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags
+    )
+    print_frame_counts("Videos before outlier removal:", labels, dataset_tags)
+    print_sampled_auc("Video-level performance from mean frame probabilities:", labels, probs, dataset_tags)
     embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags = remove_outliers(
         embeddings, labels, probs, paths, dataset_tags, video_ids, frame_positions, ok_flags,
         args.outlier_std, args.outlier_group,
     )
-    print_frame_counts("Frames used for UMAP:", labels, dataset_tags)
+    print_frame_counts("Videos used for UMAP:", labels, dataset_tags)
     if embeddings.shape[0] < 3:
-        raise ValueError("Need at least 3 frames for UMAP after filtering.")
+        raise ValueError("Need at least 3 videos for UMAP after filtering.")
 
     from sklearn.preprocessing import StandardScaler
     patch_coverage_for_numba()
@@ -798,8 +848,8 @@ def main():
         "prob_fake": probs,
         "dataset": dataset_tags,
         "video_id": video_ids,
-        "frame_position": frame_positions,
-        "path": paths,
+        "n_frames": frame_positions,
+        "example_path": paths,
     }).to_csv(coords_path, index=False)
     print("\nSaved outputs:")
     print(f"  {args.out}")
