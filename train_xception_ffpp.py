@@ -16,6 +16,9 @@ python train_xception_ffpp.py \
     --root_dir /media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out \
     --cdfv2_fake_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2 \
     --cdfv2_real_root /media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real \
+    --cdfv3_root /media/tarun/B482367C823642E2/usr/cdfv3_face_crops \
+    --dfd_fake_root /media/tarun/B482367C823642E2/usr/dfd_faces/fake \
+    --dfd_real_root /media/tarun/B482367C823642E2/usr/dfd_faces/real \
     --df0_fake_root /media/tarun/B482367C823642E2/usr/df1.0_faces/fake \
     --df0_real_root /media/tarun/B482367C823642E2/usr/df1.0_faces/real \
     --dfdc_fake_root /media/tarun/B482367C823642E2/usr/dfdc/fake \
@@ -71,6 +74,10 @@ def parse_args():
     p.add_argument("--cdfv2_fake_root", default="")
     p.add_argument("--cdfv2_real_root", default="")
 
+    # CDFv3 / CDF++ manifest layout. Manifest labels: 1=Real, 0=Fake.
+    p.add_argument("--cdfv3_root", default="")
+    p.add_argument("--cdfv3_csv", default="")
+
     # UADFV / DFo nested layouts: <root>/<video>/<frame>/image.png
     p.add_argument("--uadfv_fake_root", default="")
     p.add_argument("--uadfv_real_root", default="")
@@ -78,6 +85,8 @@ def parse_args():
     p.add_argument("--df0_real_root", default="")
     p.add_argument("--dfo_fake_root", default="")
     p.add_argument("--dfo_real_root", default="")
+    p.add_argument("--dfd_fake_root", default="")
+    p.add_argument("--dfd_real_root", default="")
 
     # DFDC / WDF flat layouts: <root>/<video_id>_<frame>.png
     p.add_argument("--dfdc_fake_root", default="")
@@ -159,6 +168,35 @@ def build_cdfv2_videos(fake_root: str, real_root: str):
                 vid2label[vid] = label
     videos = [(vid, sorted(paths), vid2label[vid]) for vid, paths in sorted(vid2paths.items())]
     print_video_counts("CDFv2", videos)
+    return videos
+
+
+def video_id_from_cdfv3_sample_dir(sample_dir: str) -> str:
+    return Path(str(sample_dir).replace("\\", "/")).parent.name
+
+
+def build_cdfv3_videos(cdfv3_csv: str, cdfv3_root: str):
+    df = pd.read_csv(cdfv3_csv)
+    required = {"sample_dir", "label"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"CDFv3/CDF++ manifest must contain {required}. Found: {list(df.columns)}")
+    df = df.copy()
+    df["label"] = df["label"].astype(int)
+    df["video_id"] = df["sample_dir"].apply(video_id_from_cdfv3_sample_dir)
+    root = Path(cdfv3_root)
+
+    videos = []
+    for video_id, group in df.groupby("video_id"):
+        manifest_label = int(group["label"].iloc[0])
+        label = 0 if manifest_label == 1 else 1
+        paths = []
+        for rel in group["sample_dir"].astype(str).str.replace("\\", "/", regex=False):
+            path = root / rel / "image.png"
+            if path.is_file():
+                paths.append(str(path))
+        if paths:
+            videos.append((str(video_id), sorted(paths), label))
+    print_video_counts("CDFv3", videos)
     return videos
 
 
@@ -255,12 +293,23 @@ def build_all_videos(args):
     else:
         print("  [skip] CDFv2 roots not provided.")
 
+    if args.cdfv3_root:
+        cdfv3_csv = args.cdfv3_csv or str(Path(args.cdfv3_root) / "manifest_cdfv3_face_crops.csv")
+        dataset_videos["CDFv3"] = build_cdfv3_videos(cdfv3_csv, args.cdfv3_root)
+    else:
+        print("  [skip] CDFv3/CDF++ root not provided.")
+
     dfo_fake = args.dfo_fake_root or args.df0_fake_root
     dfo_real = args.dfo_real_root or args.df0_real_root
     if dfo_fake and dfo_real:
         dataset_videos["DFo"] = build_nested_image_videos(dfo_fake, dfo_real, "DFo")
     else:
         print("  [skip] DFo roots not provided.")
+
+    if args.dfd_fake_root and args.dfd_real_root:
+        dataset_videos["DFD"] = build_nested_image_videos(args.dfd_fake_root, args.dfd_real_root, "DFD")
+    else:
+        print("  [skip] DFD roots not provided.")
 
     if args.uadfv_fake_root and args.uadfv_real_root:
         dataset_videos["UADFV"] = build_nested_image_videos(args.uadfv_fake_root, args.uadfv_real_root, "UADFV")
