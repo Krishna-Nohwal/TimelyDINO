@@ -57,6 +57,8 @@ parser.add_argument("--val_ratio",     default=0.05, type=float)
 parser.add_argument("--lr",            default=1e-4, type=float)
 parser.add_argument("--warmup_steps",  default=512,  type=int)
 parser.add_argument("--supcon_weight", default=1/16, type=float)
+parser.add_argument("--max_train_samples", default=0, type=int,
+                    help="Optional cap on training images. 0 uses all training images.")
 parser.add_argument("--no_compile",    action="store_true")
 args = parser.parse_args()
 
@@ -133,7 +135,49 @@ def check_layerscale(vit_backbone):
 # Data
 # ---------------------------------------------------------------------------
 
-def prepare_splits(manifest_csv: str, root_dir: str, val_ratio: float = 0.05):
+def limit_split_by_label(df: pd.DataFrame, max_samples: int, split_name: str) -> pd.DataFrame:
+    if max_samples <= 0 or len(df) <= max_samples:
+        return df
+
+    labels = sorted(df["label"].unique().tolist())
+    base = max_samples // len(labels)
+    allocations = {
+        label: min(int((df["label"] == label).sum()), base)
+        for label in labels
+    }
+
+    remaining = max_samples - sum(allocations.values())
+    while remaining > 0:
+        candidates = [
+            label for label in labels
+            if allocations[label] < int((df["label"] == label).sum())
+        ]
+        if not candidates:
+            break
+        candidates.sort(
+            key=lambda label: int((df["label"] == label).sum()) - allocations[label],
+            reverse=True,
+        )
+        allocations[candidates[0]] += 1
+        remaining -= 1
+
+    limited_parts = [
+        df[df["label"] == label].sample(n=allocations[label], random_state=42)
+        for label in labels
+        if allocations[label] > 0
+    ]
+    limited_df = pd.concat(limited_parts).sample(frac=1.0, random_state=42).reset_index(drop=True)
+    counts = limited_df["label"].value_counts().sort_index().to_dict()
+    print(f"{split_name} capped to {len(limited_df)} samples -> {counts}")
+    return limited_df
+
+
+def prepare_splits(
+    manifest_csv: str,
+    root_dir: str,
+    val_ratio: float = 0.05,
+    max_train_samples: int = 0,
+):
     df = pd.read_csv(manifest_csv)
     required = {"sample_dir", "label"}
     if not required.issubset(df.columns):
@@ -155,7 +199,11 @@ def prepare_splits(manifest_csv: str, root_dir: str, val_ratio: float = 0.05):
     train_df = pd.concat([real_train, fake_train]).sample(frac=1.0, random_state=42).reset_index(drop=True)
     val_df = pd.concat([real_val, fake_val]).sample(frac=1.0, random_state=42).reset_index(drop=True)
 
-    print(f"Train -> Real: {len(real_train)} | Fake: {len(fake_train)} | Total: {len(train_df)}")
+    train_df = limit_split_by_label(train_df, max_train_samples, "Train")
+    train_real_n = int((train_df["label"] == 0).sum())
+    train_fake_n = int((train_df["label"] == 1).sum())
+
+    print(f"Train -> Real: {train_real_n} | Fake: {train_fake_n} | Total: {len(train_df)}")
     print(f"Val   -> Real: {len(real_val)} | Fake: {len(fake_val)} | Total: {len(val_df)}")
     return train_df, val_df
 
@@ -281,7 +329,12 @@ def run_eval(model, loader, desc):
 if __name__ == "__main__":
     SEP = "=" * 80
 
-    train_df, val_df = prepare_splits(args.manifest, args.root_dir, val_ratio=args.val_ratio)
+    train_df, val_df = prepare_splits(
+        args.manifest,
+        args.root_dir,
+        val_ratio=args.val_ratio,
+        max_train_samples=args.max_train_samples,
+    )
     train_dataset = ManifestImageDataset(train_df, args.root_dir)
     val_dataset = ManifestImageDataset(val_df, args.root_dir)
     cdf_dataset = CDFv1Dataset(args.cdf_csv, args.cdf_root)
