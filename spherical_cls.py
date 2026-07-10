@@ -48,7 +48,7 @@ from augmentations import augment_batch, load_and_resize, normalize
 parser = argparse.ArgumentParser(
     description="Stage 1 spherical CLS training: final-layer CLS + fixed simplex prototypes"
 )
-parser.add_argument("--epochs",        default=50,   type=int)
+parser.add_argument("--epochs",        default=5,    type=int)
 parser.add_argument("--batch_size",    default=128,  type=int)
 parser.add_argument("--num_workers",   default=36,   type=int)
 parser.add_argument("--save_root",     default="checkpoints_spherical_cls_ft", type=str)
@@ -61,11 +61,15 @@ parser.add_argument("--cdf_root",      default="/media/tarun/B482367C823642E2/us
 parser.add_argument("--cdf_csv",       default="/media/tarun/B482367C823642E2/usr/cdfv1_onct_out/manifest_cdfv1_onct.csv", type=str)
 parser.add_argument("--val_ratio",     default=0.005, type=float,
                     help="Tiny per-dataset frame-level validation split.")
-parser.add_argument("--lr",            default=1e-4, type=float)
+parser.add_argument("--lr",            default=2e-5, type=float,
+                    help="Lower default for gentle finetuning from an existing checkpoint.")
 parser.add_argument("--warmup_steps",  default=512,  type=int)
 parser.add_argument("--supcon_weight", default=1/16, type=float)
 parser.add_argument("--sphere_dim",    default=512,  type=int)
 parser.add_argument("--sphere_scale",  default=16.0, type=float)
+parser.add_argument("--lora_r",        default=32,   type=int)
+parser.add_argument("--lora_alpha",    default=64,   type=int)
+parser.add_argument("--lora_dropout",  default=0.10, type=float)
 parser.add_argument("--max_train_samples", default=0, type=int,
                     help="Optional cap on training images. 0 uses all training images.")
 parser.add_argument("--max_val_samples", default=0, type=int,
@@ -91,6 +95,9 @@ parser.add_argument("--wdf_fake_root",   default="/raid/krishna/wdf/test/fake", 
 parser.add_argument("--wdf_real_root",   default="/raid/krishna/wdf/test/real", type=str)
 parser.add_argument("--uadfv_fake_root", default="/raid/krishna/uadfv_faces/fake", type=str)
 parser.add_argument("--uadfv_real_root", default="/raid/krishna/uadfv_faces/real", type=str)
+parser.add_argument("--dvf_root",       default="/media/tarun/B482367C823642E2/usr/dvf/DVF_recons_tiny", type=str)
+parser.add_argument("--include_base_datasets", action="store_true",
+                    help="Also train on the older FFPP/CDF/DFD/DFDC/WDF/UADFV frame pools. Default is DVF only.")
 parser.add_argument("--no_compile",    action="store_true")
 args = parser.parse_args()
 
@@ -173,7 +180,14 @@ class SphericalCLSViT(nn.Module):
     DROP_PATH = 0.10
     NUM_CLASSES = 2
 
-    def __init__(self, sphere_dim: int = 512, sphere_scale: float = 16.0):
+    def __init__(
+        self,
+        sphere_dim: int = 512,
+        sphere_scale: float = 16.0,
+        lora_r: int = 32,
+        lora_alpha: int = 64,
+        lora_dropout: float = 0.10,
+    ):
         super().__init__()
         self.vit = timm.create_model(
             "vit_large_patch16_dinov3.lvd1689m",
@@ -183,10 +197,10 @@ class SphericalCLSViT(nn.Module):
             drop_path_rate=self.DROP_PATH,
         )
         self.vit = get_peft_model(self.vit, LoraConfig(
-            r=32,
-            lora_alpha=64,
+            r=lora_r,
+            lora_alpha=lora_alpha,
             target_modules=["attn.qkv"],
-            lora_dropout=0.10,
+            lora_dropout=lora_dropout,
             bias="none",
             task_type="FEATURE_EXTRACTION",
         ))
@@ -413,21 +427,65 @@ def build_flat_items(fake_root: str, real_root: str, dataset_name: str):
     return items
 
 
+def build_dvf_items(dvf_root: str):
+    if not dvf_root:
+        print("  [skip] DVF: --dvf_root not provided.")
+        return []
+
+    root = Path(dvf_root)
+    if not root.is_dir():
+        print(f"  [skip] DVF: missing root {root}")
+        return []
+
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    items = []
+    skipped_sources = 0
+
+    for source_dir in sorted(root.iterdir()):
+        if not source_dir.is_dir():
+            continue
+
+        for class_dir_name, label in [("0_real", 0), ("1_fake", 1)]:
+            original_dir = source_dir / class_dir_name / "original"
+            if not original_dir.is_dir():
+                skipped_sources += 1
+                continue
+
+            dataset_name = f"DVF_{source_dir.name}"
+            for path in sorted(original_dir.rglob("*")):
+                if path.is_file() and path.suffix.lower() in image_exts:
+                    items.append({
+                        "path": str(path),
+                        "label": label,
+                        "dataset": dataset_name,
+                    })
+
+    if skipped_sources:
+        print(f"  [DVF] skipped {skipped_sources} missing 0_real/original or 1_fake/original folders")
+    print_dataset_item_counts("DVF frames loaded", items)
+    return items
+
+
 def build_dataset_items(args):
     print("\nBuilding training dataset frame lists ...")
     dataset_items = {
-        "FFPP": build_ffpp_items(args.manifest, args.root_dir),
-        "CDFv2": build_cdfv2_items(args.cdfv2_fake_root, args.cdfv2_real_root),
-        "CDFv3": build_cdfv3_items(args.cdfv3_csv, args.cdfv3_root),
+        "DVF": build_dvf_items(args.dvf_root),
     }
 
-    dfo_fake = args.dfo_fake_root or args.df0_fake_root
-    dfo_real = args.dfo_real_root or args.df0_real_root
-    dataset_items["DFo"] = build_nested_image_items(dfo_fake, dfo_real, "DFo")
-    dataset_items["DFD"] = build_nested_image_items(args.dfd_fake_root, args.dfd_real_root, "DFD")
-    dataset_items["DFDC"] = build_flat_items(args.dfdc_fake_root, args.dfdc_real_root, "DFDC")
-    dataset_items["WDF"] = build_flat_items(args.wdf_fake_root, args.wdf_real_root, "WDF")
-    dataset_items["UADFV"] = build_nested_image_items(args.uadfv_fake_root, args.uadfv_real_root, "UADFV")
+    if args.include_base_datasets:
+        dataset_items.update({
+            "FFPP": build_ffpp_items(args.manifest, args.root_dir),
+            "CDFv2": build_cdfv2_items(args.cdfv2_fake_root, args.cdfv2_real_root),
+            "CDFv3": build_cdfv3_items(args.cdfv3_csv, args.cdfv3_root),
+        })
+
+        dfo_fake = args.dfo_fake_root or args.df0_fake_root
+        dfo_real = args.dfo_real_root or args.df0_real_root
+        dataset_items["DFo"] = build_nested_image_items(dfo_fake, dfo_real, "DFo")
+        dataset_items["DFD"] = build_nested_image_items(args.dfd_fake_root, args.dfd_real_root, "DFD")
+        dataset_items["DFDC"] = build_flat_items(args.dfdc_fake_root, args.dfdc_real_root, "DFDC")
+        dataset_items["WDF"] = build_flat_items(args.wdf_fake_root, args.wdf_real_root, "WDF")
+        dataset_items["UADFV"] = build_nested_image_items(args.uadfv_fake_root, args.uadfv_real_root, "UADFV")
     return {name: items for name, items in dataset_items.items() if items}
 
 
@@ -690,6 +748,9 @@ if __name__ == "__main__":
     model = SphericalCLSViT(
         sphere_dim=args.sphere_dim,
         sphere_scale=args.sphere_scale,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
     ).to(device)
     check_layerscale(model.vit.base_model.model)
 
