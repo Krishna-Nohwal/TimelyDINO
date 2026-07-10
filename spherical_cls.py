@@ -1,22 +1,22 @@
 """
 Spherical CLS-only Stage 1 training script.
 
-This is a controlled variant of cls.py. It still uses both real and fake
-labels and still trains only on the final-layer DINOv3 CLS token, but replaces
-the learnable linear classifier with fixed simplex prototypes on the unit
-hypersphere:
+This is a spherical variant of cls.py. It uses both real and fake labels,
+trains on a combined multi-dataset frame pool, and still uses only the
+final-layer DINOv3 CLS token. The learnable linear classifier is replaced with
+fixed simplex prototypes on the unit hypersphere:
 
   cls_last -> projector -> L2 normalize -> cosine logits to fixed prototypes
   loss     = CrossEntropy(logits, labels) + lambda * SupCon(sphere_features, labels)
 
 For the binary real/fake case, the simplex prototypes are antipodal anchors on
-the sphere. This tests spherical prototype geometry against the plain CLS
-linear baseline without changing the dataset or the backbone.
+the sphere. CDFv1 remains the held-out per-epoch test set.
 """
 
 import argparse
 import math
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -53,11 +53,12 @@ parser.add_argument("--batch_size",    default=128,  type=int)
 parser.add_argument("--num_workers",   default=36,   type=int)
 parser.add_argument("--save_root",     default="checkpoints_spherical_cls", type=str)
 parser.add_argument("--load_from",     default="",   type=str)
-parser.add_argument("--manifest",      default="E:/Work/sampled_30k/manifest_onct.csv", type=str)
-parser.add_argument("--root_dir",      default="E:/Work/sampled_30k/", type=str)
-parser.add_argument("--cdf_root",      default="E:/Work/cdfv1_onct_out", type=str)
-parser.add_argument("--cdf_csv",       default="E:/Work/cdfv1_onct_out/manifest_cdfv1_onct.csv", type=str)
-parser.add_argument("--val_ratio",     default=0.05, type=float)
+parser.add_argument("--manifest",      default="/media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/manifest_ff_onct.csv", type=str)
+parser.add_argument("--root_dir",      default="/media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out", type=str)
+parser.add_argument("--cdf_root",      default="/media/tarun/B482367C823642E2/usr/cdfv1_onct_out", type=str)
+parser.add_argument("--cdf_csv",       default="/media/tarun/B482367C823642E2/usr/cdfv1_onct_out/manifest_cdfv1_onct.csv", type=str)
+parser.add_argument("--val_ratio",     default=0.005, type=float,
+                    help="Tiny per-dataset frame-level validation split.")
 parser.add_argument("--lr",            default=1e-4, type=float)
 parser.add_argument("--warmup_steps",  default=512,  type=int)
 parser.add_argument("--supcon_weight", default=1/16, type=float)
@@ -65,6 +66,29 @@ parser.add_argument("--sphere_dim",    default=512,  type=int)
 parser.add_argument("--sphere_scale",  default=16.0, type=float)
 parser.add_argument("--max_train_samples", default=0, type=int,
                     help="Optional cap on training images. 0 uses all training images.")
+parser.add_argument("--max_val_samples", default=0, type=int,
+                    help="Optional cap on validation images. 0 uses all validation images.")
+parser.add_argument("--max_frames_per_dataset", default=0, type=int,
+                    help="Optional stratified train-frame cap per dataset. 0 uses all frames.")
+parser.add_argument("--seed", default=42, type=int)
+
+# Extra training datasets from the UMAP scripts.
+parser.add_argument("--cdfv2_fake_root", default="/media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2", type=str)
+parser.add_argument("--cdfv2_real_root", default="/media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real", type=str)
+parser.add_argument("--cdfv3_root",      default="/media/tarun/B482367C823642E2/usr/cdfv3_face_crops", type=str)
+parser.add_argument("--cdfv3_csv",       default="/media/tarun/B482367C823642E2/usr/cdfv3_face_crops/manifest_cdfv3_face_crops.csv", type=str)
+parser.add_argument("--df0_fake_root",   default="/media/tarun/B482367C823642E2/usr/df1.0_faces/fake", type=str)
+parser.add_argument("--df0_real_root",   default="/media/tarun/B482367C823642E2/usr/df1.0_faces/real", type=str)
+parser.add_argument("--dfo_fake_root",   default="", type=str)
+parser.add_argument("--dfo_real_root",   default="", type=str)
+parser.add_argument("--dfd_fake_root",   default="/media/tarun/B482367C823642E2/usr/dfd_faces/fake", type=str)
+parser.add_argument("--dfd_real_root",   default="/media/tarun/B482367C823642E2/usr/dfd_faces/real", type=str)
+parser.add_argument("--dfdc_fake_root",  default="/media/tarun/B482367C823642E2/usr/dfdc/fake", type=str)
+parser.add_argument("--dfdc_real_root",  default="/media/tarun/B482367C823642E2/usr/dfdc/real", type=str)
+parser.add_argument("--wdf_fake_root",   default="/media/tarun/B482367C823642E2/usr/wdf/test/fake", type=str)
+parser.add_argument("--wdf_real_root",   default="/media/tarun/B482367C823642E2/usr/wdf/test/real", type=str)
+parser.add_argument("--uadfv_fake_root", default="/media/tarun/B482367C823642E2/usr/uadfv_faces/fake", type=str)
+parser.add_argument("--uadfv_real_root", default="/media/tarun/B482367C823642E2/usr/uadfv_faces/real", type=str)
 parser.add_argument("--no_compile",    action="store_true")
 args = parser.parse_args()
 
@@ -200,107 +224,242 @@ def check_layerscale(vit_backbone):
 # Data
 # ---------------------------------------------------------------------------
 
-def limit_split_by_label(df: pd.DataFrame, max_samples: int, split_name: str) -> pd.DataFrame:
-    if max_samples <= 0 or len(df) <= max_samples:
-        return df
+def cap_items_by_label(items: list[dict], cap: int, seed: int, split_name: str) -> list[dict]:
+    if cap <= 0 or len(items) <= cap:
+        return items
 
-    labels = sorted(df["label"].unique().tolist())
-    base = max_samples // len(labels)
-    allocations = {
-        label: min(int((df["label"] == label).sum()), base)
-        for label in labels
-    }
+    rng = np.random.default_rng(seed)
+    reals = [item for item in items if item["label"] == 0]
+    fakes = [item for item in items if item["label"] == 1]
+    if not reals or not fakes:
+        idx = rng.choice(len(items), size=cap, replace=False)
+        capped = [items[int(i)] for i in idx]
+    else:
+        n_real = min(len(reals), cap // 2)
+        n_fake = min(len(fakes), cap - n_real)
+        n_real = min(len(reals), cap - n_fake)
+        real_idx = rng.choice(len(reals), size=n_real, replace=False)
+        fake_idx = rng.choice(len(fakes), size=n_fake, replace=False)
+        capped = [reals[int(i)] for i in real_idx] + [fakes[int(i)] for i in fake_idx]
 
-    remaining = max_samples - sum(allocations.values())
-    while remaining > 0:
-        candidates = [
-            label for label in labels
-            if allocations[label] < int((df["label"] == label).sum())
-        ]
-        if not candidates:
-            break
-        candidates.sort(
-            key=lambda label: int((df["label"] == label).sum()) - allocations[label],
-            reverse=True,
-        )
-        allocations[candidates[0]] += 1
-        remaining -= 1
-
-    limited_parts = [
-        df[df["label"] == label].sample(n=allocations[label], random_state=42)
-        for label in labels
-        if allocations[label] > 0
-    ]
-    limited_df = pd.concat(limited_parts).sample(frac=1.0, random_state=42).reset_index(drop=True)
-    counts = limited_df["label"].value_counts().sort_index().to_dict()
-    print(f"{split_name} capped to {len(limited_df)} samples -> {counts}")
-    return limited_df
+    order = rng.permutation(len(capped))
+    capped = [capped[int(i)] for i in order]
+    print_dataset_item_counts(f"{split_name} capped", capped)
+    return capped
 
 
-def prepare_splits(
-    manifest_csv: str,
-    root_dir: str,
-    val_ratio: float = 0.05,
-    max_train_samples: int = 0,
-):
+def split_items_by_label(items: list[dict], val_ratio: float, seed: int):
+    if val_ratio <= 0:
+        return items, []
+
+    rng = np.random.default_rng(seed)
+    train, val = [], []
+    for label in sorted(set(item["label"] for item in items)):
+        class_items = [item for item in items if item["label"] == label]
+        if len(class_items) <= 1:
+            train.extend(class_items)
+            continue
+        order = rng.permutation(len(class_items))
+        class_items = [class_items[int(i)] for i in order]
+        val_n = max(1, int(len(class_items) * val_ratio))
+        val_n = min(val_n, len(class_items) - 1)
+        val.extend(class_items[:val_n])
+        train.extend(class_items[val_n:])
+    return train, val
+
+
+def print_dataset_item_counts(title: str, items: list[dict]):
+    print(f"\n{title}:")
+    by_dataset = defaultdict(lambda: [0, 0, 0])
+    for item in items:
+        counts = by_dataset[item["dataset"]]
+        counts[0] += 1
+        counts[1 + int(item["label"])] += 1
+    total = [0, 0, 0]
+    for dataset in sorted(by_dataset):
+        counts = by_dataset[dataset]
+        total = [a + b for a, b in zip(total, counts)]
+        print(f"  {dataset:<8} frames={counts[0]:>8} real={counts[1]:>8} fake={counts[2]:>8}")
+    print(f"  {'TOTAL':<8} frames={total[0]:>8} real={total[1]:>8} fake={total[2]:>8}")
+
+
+def build_ffpp_items(manifest_csv: str, root_dir: str):
+    if not manifest_csv or not root_dir:
+        print("  [skip] FFPP: --manifest / --root_dir not provided.")
+        return []
+
     df = pd.read_csv(manifest_csv)
     required = {"sample_dir", "label"}
     if not required.issubset(df.columns):
-        raise ValueError(f"Manifest must contain {required}. Found: {list(df.columns)}")
+        raise ValueError(f"FF++ manifest must contain {required}. Found: {list(df.columns)}")
 
-    real_pool = df[df["label"] == 0].sample(frac=1.0, random_state=42).reset_index(drop=True)
-    fake_pool = df[df["label"] == 1].sample(frac=1.0, random_state=42).reset_index(drop=True)
+    df = df.copy()
+    df["label"] = df["label"].astype(int)
+    root = Path(root_dir)
 
-    print(f"Full dataset -> Real: {len(real_pool)} | Fake: {len(fake_pool)}")
-
-    real_val_n = int(len(real_pool) * val_ratio)
-    fake_val_n = int(len(fake_pool) * val_ratio)
-
-    real_val = real_pool.iloc[:real_val_n]
-    real_train = real_pool.iloc[real_val_n:]
-    fake_val = fake_pool.iloc[:fake_val_n]
-    fake_train = fake_pool.iloc[fake_val_n:]
-
-    train_df = pd.concat([real_train, fake_train]).sample(frac=1.0, random_state=42).reset_index(drop=True)
-    val_df = pd.concat([real_val, fake_val]).sample(frac=1.0, random_state=42).reset_index(drop=True)
-
-    train_df = limit_split_by_label(train_df, max_train_samples, "Train")
-    train_real_n = int((train_df["label"] == 0).sum())
-    train_fake_n = int((train_df["label"] == 1).sum())
-
-    print(f"Train -> Real: {train_real_n} | Fake: {train_fake_n} | Total: {len(train_df)}")
-    print(f"Val   -> Real: {len(real_val)} | Fake: {len(fake_val)} | Total: {len(val_df)}")
-    return train_df, val_df
+    items, skipped = [], 0
+    for rel, label in zip(df["sample_dir"].astype(str).str.replace("\\", "/", regex=False), df["label"]):
+        rel_path = Path(rel)
+        path = rel_path / "image.png" if rel_path.is_absolute() else root / rel / "image.png"
+        if path.is_file():
+            items.append({"path": str(path), "label": int(label), "dataset": "FFPP"})
+        else:
+            skipped += 1
+    if skipped:
+        print(f"  [FFPP] skipped {skipped} missing image.png files")
+    print_dataset_item_counts("FFPP frames loaded", items)
+    return items
 
 
-class ManifestImageDataset(Dataset):
-    """Train/val dataset. label: 0=Real, 1=Fake."""
+def build_cdfv2_items(fake_root: str, real_root: str):
+    items = []
+    for root_str, label in [(fake_root, 1), (real_root, 0)]:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"  [CDFv2] WARNING: missing root {root}")
+            continue
+        for d in sorted(root.iterdir()):
+            path = d / "image.png"
+            if d.is_dir() and path.exists():
+                items.append({"path": str(path), "label": label, "dataset": "CDFv2"})
+    print_dataset_item_counts("CDFv2 frames loaded", items)
+    return items
 
-    def __init__(self, df: pd.DataFrame, root_dir: str):
-        paths = (
-            df["sample_dir"]
-            .str.replace("\\", "/", regex=False)
-            .str.split("sampled_30k/", n=1)
-            .str[-1]
-            .apply(lambda rel: os.path.join(root_dir, rel, "image.png"))
-        )
-        labels = df["label"].astype(int).values
 
-        exists_mask = np.array([os.path.exists(p) for p in paths])
-        skipped = int((~exists_mask).sum())
+def build_cdfv3_items(cdfv3_csv: str, cdfv3_root: str):
+    if not cdfv3_root:
+        print("  [skip] CDFv3: --cdfv3_root not provided.")
+        return []
+    cdfv3_csv = cdfv3_csv or str(Path(cdfv3_root) / "manifest_cdfv3_face_crops.csv")
+
+    df = pd.read_csv(cdfv3_csv)
+    required = {"sample_dir", "label"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"CDFv3 manifest must contain {required}. Found: {list(df.columns)}")
+    df = df.copy()
+    df["label"] = df["label"].astype(int)
+    root = Path(cdfv3_root)
+
+    items, skipped = [], 0
+    for rel, manifest_label in zip(df["sample_dir"].astype(str).str.replace("\\", "/", regex=False), df["label"]):
+        label = 0 if int(manifest_label) == 1 else 1
+        rel_path = Path(rel)
+        path = rel_path / "image.png" if rel_path.is_absolute() else root / rel / "image.png"
+        if path.is_file():
+            items.append({"path": str(path), "label": label, "dataset": "CDFv3"})
+        else:
+            skipped += 1
+    if skipped:
+        print(f"  [CDFv3] skipped {skipped} missing image.png files")
+    print_dataset_item_counts("CDFv3 frames loaded", items)
+    return items
+
+
+def build_nested_image_items(fake_root: str, real_root: str, dataset_name: str):
+    items = []
+    for root_str, label in [(fake_root, 1), (real_root, 0)]:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"  [{dataset_name}] WARNING: missing root {root}")
+            continue
+        for path in sorted(root.rglob("image.png")):
+            if path.is_file():
+                items.append({"path": str(path), "label": label, "dataset": dataset_name})
+    print_dataset_item_counts(f"{dataset_name} frames loaded", items)
+    return items
+
+
+def build_flat_items(fake_root: str, real_root: str, dataset_name: str):
+    items = []
+    for root_str, label in [(fake_root, 1), (real_root, 0)]:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"  [{dataset_name}] WARNING: missing root {root}")
+            continue
+        skipped = 0
+        for path in sorted(root.iterdir()):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                skipped += 1
+                continue
+            items.append({"path": str(path), "label": label, "dataset": dataset_name})
         if skipped:
-            print(f"  [Dataset] Skipped {skipped} missing image.png ({exists_mask.sum()} remaining)")
+            print(f"  [{dataset_name}] skipped {skipped} files under {root}")
+    print_dataset_item_counts(f"{dataset_name} frames loaded", items)
+    return items
 
-        self.entries = list(zip(paths[exists_mask], labels[exists_mask]))
+
+def build_dataset_items(args):
+    print("\nBuilding training dataset frame lists ...")
+    dataset_items = {
+        "FFPP": build_ffpp_items(args.manifest, args.root_dir),
+        "CDFv2": build_cdfv2_items(args.cdfv2_fake_root, args.cdfv2_real_root),
+        "CDFv3": build_cdfv3_items(args.cdfv3_csv, args.cdfv3_root),
+    }
+
+    dfo_fake = args.dfo_fake_root or args.df0_fake_root
+    dfo_real = args.dfo_real_root or args.df0_real_root
+    dataset_items["DFo"] = build_nested_image_items(dfo_fake, dfo_real, "DFo")
+    dataset_items["DFD"] = build_nested_image_items(args.dfd_fake_root, args.dfd_real_root, "DFD")
+    dataset_items["DFDC"] = build_flat_items(args.dfdc_fake_root, args.dfdc_real_root, "DFDC")
+    dataset_items["WDF"] = build_flat_items(args.wdf_fake_root, args.wdf_real_root, "WDF")
+    dataset_items["UADFV"] = build_nested_image_items(args.uadfv_fake_root, args.uadfv_real_root, "UADFV")
+    return {name: items for name, items in dataset_items.items() if items}
+
+
+def prepare_splits(args):
+    dataset_items = build_dataset_items(args)
+    if not dataset_items:
+        raise ValueError("No training frames found. Check dataset paths.")
+
+    train_items, val_items = [], []
+    print("\nFrame-level train/val split:")
+    for offset, (dataset_name, items) in enumerate(sorted(dataset_items.items()), start=100):
+        dataset_train, dataset_val = split_items_by_label(items, args.val_ratio, args.seed + offset + 1000)
+        dataset_train = cap_items_by_label(
+            dataset_train,
+            args.max_frames_per_dataset,
+            args.seed + offset + 2000,
+            f"{dataset_name} train",
+        )
+        print(
+            f"  {dataset_name:<8} total_frames={len(items):>8} "
+            f"train_frames={len(dataset_train):>8} val_frames={len(dataset_val):>6}"
+        )
+        train_items.extend(dataset_train)
+        val_items.extend(dataset_val)
+
+    train_items = cap_items_by_label(train_items, args.max_train_samples, args.seed + 9999, "Combined train")
+    val_items = cap_items_by_label(val_items, args.max_val_samples, args.seed + 10099, "Combined val")
+
+    if not train_items:
+        raise ValueError("No training frames found after split/caps.")
+    if not val_items:
+        raise ValueError("No validation frames found. Increase --val_ratio or check dataset paths.")
+
+    rng = np.random.default_rng(args.seed)
+    train_items = [train_items[int(i)] for i in rng.permutation(len(train_items))]
+    val_items = [val_items[int(i)] for i in rng.permutation(len(val_items))]
+    print_dataset_item_counts("Combined train frames", train_items)
+    print_dataset_item_counts("Combined val frames", val_items)
+    return train_items, val_items
+
+
+class FrameItemDataset(Dataset):
+    """Multi-dataset frame loader. label: 0=Real, 1=Fake."""
+
+    def __init__(self, items: list[dict]):
+        self.items = items
 
     def __len__(self):
-        return len(self.entries)
+        return len(self.items)
 
     def __getitem__(self, idx):
-        img_path, label = self.entries[idx]
-        img = load_and_resize(img_path, IMG_SIZE)
+        item = self.items[idx]
+        img = load_and_resize(item["path"], IMG_SIZE)
         img = normalize(img)
-        return img, label
+        return img, int(item["label"])
 
 
 class CDFv1Dataset(Dataset):
@@ -394,14 +553,9 @@ def run_eval(model, loader, desc):
 if __name__ == "__main__":
     SEP = "=" * 80
 
-    train_df, val_df = prepare_splits(
-        args.manifest,
-        args.root_dir,
-        val_ratio=args.val_ratio,
-        max_train_samples=args.max_train_samples,
-    )
-    train_dataset = ManifestImageDataset(train_df, args.root_dir)
-    val_dataset = ManifestImageDataset(val_df, args.root_dir)
+    train_items, val_items = prepare_splits(args)
+    train_dataset = FrameItemDataset(train_items)
+    val_dataset = FrameItemDataset(val_items)
     cdf_dataset = CDFv1Dataset(args.cdf_csv, args.cdf_root)
 
     _persistent = _num_workers > 0
