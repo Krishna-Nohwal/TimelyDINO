@@ -51,10 +51,12 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--epochs",        default=50,   type=int)
 parser.add_argument("--batch_size",    default=128,  type=int)
 parser.add_argument("--num_workers",   default=36,   type=int)
-parser.add_argument("--save_root",     default="checkpoints_spherical_cls", type=str)
-parser.add_argument("--load_from",     default="",   type=str)
-parser.add_argument("--manifest",      default="/media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out/manifest_ff_onct.csv", type=str)
-parser.add_argument("--root_dir",      default="/media/tarun/B482367C823642E2/usr/ff++/onct_preprocessed_out", type=str)
+parser.add_argument("--save_root",     default="checkpoints_spherical_cls_ft", type=str)
+parser.add_argument("--load_from",     default="checkpoints_spherical_cls/best.pth",   type=str)
+parser.add_argument("--no_resume_state", action="store_true",
+                    help="Load model weights only from --load_from, ignoring optimizer/scheduler/scaler state.")
+parser.add_argument("--manifest", type=str)
+parser.add_argument("--root_dir", type=str)
 parser.add_argument("--cdf_root",      default="/media/tarun/B482367C823642E2/usr/cdfv1_onct_out", type=str)
 parser.add_argument("--cdf_csv",       default="/media/tarun/B482367C823642E2/usr/cdfv1_onct_out/manifest_cdfv1_onct.csv", type=str)
 parser.add_argument("--val_ratio",     default=0.005, type=float,
@@ -73,8 +75,8 @@ parser.add_argument("--max_frames_per_dataset", default=0, type=int,
 parser.add_argument("--seed", default=42, type=int)
 
 # Extra training datasets from the UMAP scripts.
-parser.add_argument("--cdfv2_fake_root", default="/media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/fake/cdfv2", type=str)
-parser.add_argument("--cdfv2_real_root", default="/media/tarun/B482367C823642E2/usr/preprocessed_cdfv2_test32/real", type=str)
+parser.add_argument("--cdfv2_fake_root", type=str)
+parser.add_argument("--cdfv2_real_root", type=str)
 parser.add_argument("--cdfv3_root",      default="/raid/krishna/cdfv3_face_crops", type=str)
 parser.add_argument("--cdfv3_csv",       default="/raid/krishna/cdfv3_face_crops/manifest_cdfv3_face_crops.csv", type=str)
 parser.add_argument("--df0_fake_root",   default="/raid/krishna/df1.0_faces/fake", type=str)
@@ -287,6 +289,12 @@ def build_ffpp_items(manifest_csv: str, root_dir: str):
     if not manifest_csv or not root_dir:
         print("  [skip] FFPP: --manifest / --root_dir not provided.")
         return []
+    if not Path(manifest_csv).is_file():
+        print(f"  [skip] FFPP: missing manifest {manifest_csv}")
+        return []
+    if not Path(root_dir).is_dir():
+        print(f"  [skip] FFPP: missing root {root_dir}")
+        return []
 
     df = pd.read_csv(manifest_csv)
     required = {"sample_dir", "label"}
@@ -312,6 +320,9 @@ def build_ffpp_items(manifest_csv: str, root_dir: str):
 
 
 def build_cdfv2_items(fake_root: str, real_root: str):
+    if not fake_root or not real_root:
+        print("  [skip] CDFv2: --cdfv2_fake_root / --cdfv2_real_root not provided.")
+        return []
     items = []
     for root_str, label in [(fake_root, 1), (real_root, 0)]:
         root = Path(root_str)
@@ -331,6 +342,12 @@ def build_cdfv3_items(cdfv3_csv: str, cdfv3_root: str):
         print("  [skip] CDFv3: --cdfv3_root not provided.")
         return []
     cdfv3_csv = cdfv3_csv or str(Path(cdfv3_root) / "manifest_cdfv3_face_crops.csv")
+    if not Path(cdfv3_root).is_dir():
+        print(f"  [skip] CDFv3: missing root {cdfv3_root}")
+        return []
+    if not Path(cdfv3_csv).is_file():
+        print(f"  [skip] CDFv3: missing manifest {cdfv3_csv}")
+        return []
 
     df = pd.read_csv(cdfv3_csv)
     required = {"sample_dir", "label"}
@@ -356,6 +373,9 @@ def build_cdfv3_items(cdfv3_csv: str, cdfv3_root: str):
 
 
 def build_nested_image_items(fake_root: str, real_root: str, dataset_name: str):
+    if not fake_root or not real_root:
+        print(f"  [skip] {dataset_name}: fake/real roots not provided.")
+        return []
     items = []
     for root_str, label in [(fake_root, 1), (real_root, 0)]:
         root = Path(root_str)
@@ -370,6 +390,9 @@ def build_nested_image_items(fake_root: str, real_root: str, dataset_name: str):
 
 
 def build_flat_items(fake_root: str, real_root: str, dataset_name: str):
+    if not fake_root or not real_root:
+        print(f"  [skip] {dataset_name}: fake/real roots not provided.")
+        return []
     items = []
     for root_str, label in [(fake_root, 1), (real_root, 0)]:
         root = Path(root_str)
@@ -546,6 +569,77 @@ def run_eval(model, loader, desc):
     return all_labels, all_probs
 
 
+def clean_state_dict(state):
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
+    if any(k.startswith("module.") for k in state):
+        state = {k.replace("module.", "", 1): v for k, v in state.items()}
+    return state
+
+
+def load_training_checkpoint(path: str):
+    ckpt_path = Path(path)
+    if ckpt_path.is_dir():
+        resume_path = ckpt_path / "latest_resume.pth"
+        best_path = ckpt_path / "best.pth"
+        ckpt_path = resume_path if resume_path.is_file() else best_path
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    try:
+        raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        raw = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(raw, dict) and "model" in raw:
+        model_state = clean_state_dict(raw["model"])
+        train_state = raw
+    elif isinstance(raw, dict) and "state_dict" in raw:
+        model_state = clean_state_dict(raw["state_dict"])
+        train_state = raw
+    elif isinstance(raw, dict) and "model_state_dict" in raw:
+        model_state = clean_state_dict(raw["model_state_dict"])
+        train_state = raw
+    else:
+        model_state = clean_state_dict(raw)
+        train_state = {}
+    return ckpt_path, model_state, train_state
+
+
+def make_resume_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch: int,
+    best_test_auc: float,
+    best_epoch: int,
+):
+    live_module = model._orig_mod if hasattr(model, "_orig_mod") else model
+    return {
+        "epoch": epoch,
+        "model": live_module.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "best_test_auc": best_test_auc,
+        "best_epoch": best_epoch,
+        "args": vars(args),
+    }
+
+
+def cdfv1_available(cdf_csv: str, cdf_root: str) -> bool:
+    if not cdf_csv or not cdf_root:
+        print("CDFv1 eval disabled: --cdf_csv / --cdf_root not provided.")
+        return False
+    if not Path(cdf_csv).is_file():
+        print(f"CDFv1 eval disabled: missing manifest {cdf_csv}")
+        return False
+    if not Path(cdf_root).is_dir():
+        print(f"CDFv1 eval disabled: missing root {cdf_root}")
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -556,7 +650,7 @@ if __name__ == "__main__":
     train_items, val_items = prepare_splits(args)
     train_dataset = FrameItemDataset(train_items)
     val_dataset = FrameItemDataset(val_items)
-    cdf_dataset = CDFv1Dataset(args.cdf_csv, args.cdf_root)
+    cdf_dataset = CDFv1Dataset(args.cdf_csv, args.cdf_root) if cdfv1_available(args.cdf_csv, args.cdf_root) else None
 
     _persistent = _num_workers > 0
     _prefetch = 4 if _num_workers > 0 else None
@@ -579,15 +673,17 @@ if __name__ == "__main__":
         persistent_workers=_persistent,
         prefetch_factor=_prefetch,
     )
-    cdf_loader = DataLoader(
-        cdf_dataset,
-        batch_size=args.batch_size,
-        num_workers=_num_workers,
-        pin_memory=True,
-        shuffle=False,
-        persistent_workers=_persistent,
-        prefetch_factor=_prefetch,
-    )
+    cdf_loader = None
+    if cdf_dataset is not None:
+        cdf_loader = DataLoader(
+            cdf_dataset,
+            batch_size=args.batch_size,
+            num_workers=_num_workers,
+            pin_memory=True,
+            shuffle=False,
+            persistent_workers=_persistent,
+            prefetch_factor=_prefetch,
+        )
 
     os.makedirs(args.save_root, exist_ok=True)
 
@@ -597,9 +693,14 @@ if __name__ == "__main__":
     ).to(device)
     check_layerscale(model.vit.base_model.model)
 
+    train_state = {}
+    start_epoch = 0
     if args.load_from:
-        model.load_state_dict(torch.load(args.load_from, map_location="cpu"))
-        print(f"Loaded checkpoint from {args.load_from}")
+        ckpt_path, model_state, train_state = load_training_checkpoint(args.load_from)
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
+        print(f"Loaded model weights from {ckpt_path}")
+        print(f"  missing keys   : {len(missing)}")
+        print(f"  unexpected keys: {len(unexpected)}")
 
     if not args.no_compile and hasattr(torch, "compile"):
         print("Compiling model with torch.compile ...")
@@ -611,27 +712,55 @@ if __name__ == "__main__":
     epochs = args.epochs
     iter_per_epoch = len(train_loader)
     total_steps = epochs * iter_per_epoch
-    warmup_steps = args.warmup_steps
+    warmup_steps = min(args.warmup_steps, max(total_steps - 1, 1))
     lr_min = 1e-6 / lr_base
 
     lr_dict = {
         i: (
-            (((1 + math.cos((i - warmup_steps) * math.pi / (total_steps - warmup_steps))) / 2) + lr_min)
+            (((1 + math.cos((i - warmup_steps) * math.pi / max(total_steps - warmup_steps, 1))) / 2) + lr_min)
             if i > warmup_steps
-            else (i / warmup_steps + lr_min)
+            else (i / max(warmup_steps, 1) + lr_min)
         )
         for i in range(total_steps)
     }
 
     optimizer = optim.AdamW(model.parameters(), lr=lr_base, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: lr_dict[step]
+        optimizer, lr_lambda=lambda step: lr_dict[min(step, total_steps - 1)]
     )
 
     best_test_auc = 0.0
     best_epoch = -1
+    if train_state and not args.no_resume_state:
+        if "optimizer" in train_state:
+            try:
+                optimizer.load_state_dict(train_state["optimizer"])
+                print("Restored optimizer state.")
+            except Exception as exc:
+                print(f"Could not restore optimizer state: {exc}")
+        if "scheduler" in train_state:
+            try:
+                scheduler.load_state_dict(train_state["scheduler"])
+                print("Restored scheduler state.")
+            except Exception as exc:
+                print(f"Could not restore scheduler state: {exc}")
+        if "scaler" in train_state:
+            try:
+                scaler.load_state_dict(train_state["scaler"])
+                print("Restored AMP scaler state.")
+            except Exception as exc:
+                print(f"Could not restore AMP scaler state: {exc}")
+        start_epoch = int(train_state.get("epoch", -1)) + 1
+        best_test_auc = float(train_state.get("best_test_auc", 0.0))
+        best_epoch = int(train_state.get("best_epoch", -1))
+        print(f"Continuing training from epoch {start_epoch + 1}/{epochs}.")
+    elif train_state and args.no_resume_state:
+        print("Loaded model weights only; optimizer/scheduler/scaler state ignored.")
 
-    for epoch in range(epochs):
+    if start_epoch >= epochs:
+        print(f"Checkpoint epoch {start_epoch} is already >= --epochs {epochs}; no training epochs to run.")
+
+    for epoch in range(start_epoch, epochs):
         print(f"\n{SEP}")
         print(f"  EPOCH {epoch+1}/{epochs}")
         print(SEP)
@@ -671,26 +800,46 @@ if __name__ == "__main__":
         compute_metrics(train_labels, train_probs, "Train", epoch)
 
         val_labels, val_probs = run_eval(model, val_loader, f"Epoch {epoch+1} [val]")
-        compute_metrics(val_labels, val_probs, "Val  ", epoch)
+        val_auc = compute_metrics(val_labels, val_probs, "Val  ", epoch)
 
-        cdf_labels, cdf_probs = run_eval(model, cdf_loader, f"Epoch {epoch+1} [CDFv1]")
-        test_auc = compute_metrics(cdf_labels, cdf_probs, "Test ", epoch)
+        if cdf_loader is not None:
+            cdf_labels, cdf_probs = run_eval(model, cdf_loader, f"Epoch {epoch+1} [CDFv1]")
+            test_auc = compute_metrics(cdf_labels, cdf_probs, "Test ", epoch)
+            score_name = "Test AUC"
+        else:
+            test_auc = val_auc
+            score_name = "Val AUC"
 
         live_module = model._orig_mod if hasattr(model, "_orig_mod") else model
         state_dict = live_module.state_dict()
-
-        torch.save(state_dict, os.path.join(args.save_root, "latest.pth"))
-        live_module.vit.save_pretrained(os.path.join(args.save_root, "latest_lora"))
+        resume_state = make_resume_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch,
+            best_test_auc,
+            best_epoch,
+        )
 
         if test_auc > best_test_auc:
             best_test_auc = test_auc
             best_epoch = epoch
+            resume_state["best_test_auc"] = best_test_auc
+            resume_state["best_epoch"] = best_epoch
             torch.save(state_dict, os.path.join(args.save_root, "best.pth"))
+            torch.save(resume_state, os.path.join(args.save_root, "best_resume.pth"))
             live_module.vit.save_pretrained(os.path.join(args.save_root, "best_lora"))
-            print(f"\n  New best Test AUC={best_test_auc:.4f} -> saved best.pth")
+            print(f"\n  New best {score_name}={best_test_auc:.4f} -> saved best.pth")
         else:
-            print(f"\n  Best so far: epoch {best_epoch+1}  Test AUC={best_test_auc:.4f}")
+            print(f"\n  Best so far: epoch {best_epoch+1}  {score_name}={best_test_auc:.4f}")
+
+        resume_state["best_test_auc"] = best_test_auc
+        resume_state["best_epoch"] = best_epoch
+        torch.save(state_dict, os.path.join(args.save_root, "latest.pth"))
+        torch.save(resume_state, os.path.join(args.save_root, "latest_resume.pth"))
+        live_module.vit.save_pretrained(os.path.join(args.save_root, "latest_lora"))
 
     print(f"\n{SEP}")
-    print(f"  Training complete. Best checkpoint: epoch {best_epoch+1}  Test AUC={best_test_auc:.4f}")
+    print(f"  Training complete. Best checkpoint: epoch {best_epoch+1}  AUC={best_test_auc:.4f}")
     print(f"  Saved to: {os.path.join(args.save_root, 'best.pth')}")
