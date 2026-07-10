@@ -24,6 +24,7 @@ Optimisation log (on top of previous version):
 """
 
 import random
+import inspect
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -49,24 +50,69 @@ _THREAD_POOL = ThreadPoolExecutor(max_workers=8)
 # Albumentations pipeline
 # ---------------------------------------------------------------------------
 
+def _has_arg(transform_cls, name: str) -> bool:
+    return name in inspect.signature(transform_cls).parameters
+
+
+def _image_compression():
+    if _has_arg(A.ImageCompression, "quality_range"):
+        return A.ImageCompression(quality_range=(30, 95), p=1.0)
+    return A.ImageCompression(quality_lower=30, quality_upper=95, p=1.0)
+
+
+def _downscale():
+    if _has_arg(A.Downscale, "scale_range"):
+        return A.Downscale(
+            scale_range=(0.5, 0.9),
+            interpolation_pair={"downscale": cv2.INTER_LINEAR, "upscale": cv2.INTER_LINEAR},
+            p=1.0,
+        )
+    return A.Downscale(
+        scale_min=0.5,
+        scale_max=0.9,
+        interpolation=cv2.INTER_LINEAR,
+        p=1.0,
+    )
+
+
+def _gauss_noise():
+    if _has_arg(A.GaussNoise, "std_range"):
+        return A.GaussNoise(std_range=(0.01, 0.04), p=0.40)
+    return A.GaussNoise(var_limit=(6.5, 104.0), mean=0.0, p=0.40)
+
+
+def _coarse_dropout():
+    if _has_arg(A.CoarseDropout, "num_holes_range"):
+        return A.CoarseDropout(
+            num_holes_range=(1, 4),
+            hole_height_range=(8, 48),
+            hole_width_range=(8, 48),
+            fill=0,
+            p=0.40,
+        )
+    return A.CoarseDropout(
+        min_holes=1,
+        max_holes=4,
+        min_height=8,
+        max_height=48,
+        min_width=8,
+        max_width=48,
+        fill_value=0,
+        p=0.40,
+    )
+
+
 _albu_pipeline = A.Compose([
     A.OneOf([
-        A.ImageCompression(quality_range=(30, 95), p=1.0),
-        A.Downscale(scale_range=(0.5, 0.9),
-                    interpolation_pair={"downscale": cv2.INTER_LINEAR,
-                                        "upscale":   cv2.INTER_LINEAR}, p=1.0),
+        _image_compression(),
+        _downscale(),
     ], p=0.6),
     A.GaussianBlur(blur_limit=(3, 7), p=0.25),
     A.MotionBlur(blur_limit=(5, 11), p=0.20),
     A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.05, p=0.40),
-    A.GaussNoise(std_range=(0.01, 0.04), p=0.40),
+    _gauss_noise(),
     A.HorizontalFlip(p=0.5),
-    A.CoarseDropout(
-        num_holes_range=(1, 4),
-        hole_height_range=(8, 48),
-        hole_width_range=(8, 48),
-        fill=0, p=0.40,
-    ),
+    _coarse_dropout(),
     A.RandomGamma(gamma_limit=(70, 150), p=0.20),
     A.Sharpen(alpha=(0.1, 0.5), lightness=(0.8, 1.2), p=0.20),
 ])
