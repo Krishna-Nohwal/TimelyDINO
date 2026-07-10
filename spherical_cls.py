@@ -95,9 +95,12 @@ parser.add_argument("--wdf_fake_root",   default="/raid/krishna/wdf/test/fake", 
 parser.add_argument("--wdf_real_root",   default="/raid/krishna/wdf/test/real", type=str)
 parser.add_argument("--uadfv_fake_root", default="/raid/krishna/uadfv_faces/fake", type=str)
 parser.add_argument("--uadfv_real_root", default="/raid/krishna/uadfv_faces/real", type=str)
-parser.add_argument("--dvf_root",       default="/media/tarun/B482367C823642E2/usr/dvf/DVF_recons_tiny", type=str)
+parser.add_argument("--gen_root",       default="/media/tarun/B482367C823642E2/usr/gen", type=str)
+parser.add_argument("--dvf_root",       default="", type=str)
+parser.add_argument("--include_dvf",    action="store_true",
+                    help="Also train on DVF frames from --dvf_root.")
 parser.add_argument("--include_base_datasets", action="store_true",
-                    help="Also train on the older FFPP/CDF/DFD/DFDC/WDF/UADFV frame pools. Default is DVF only.")
+                    help="Also train on the older FFPP/CDF/DFD/DFDC/WDF/UADFV frame pools. Default is GEN only.")
 parser.add_argument("--no_compile",    action="store_true")
 args = parser.parse_args()
 
@@ -466,11 +469,59 @@ def build_dvf_items(dvf_root: str):
     return items
 
 
+def build_gen_items(gen_root: str):
+    if not gen_root:
+        print("  [skip] GEN: --gen_root not provided.")
+        return []
+
+    root = Path(gen_root)
+    if not root.is_dir():
+        print(f"  [skip] GEN: missing root {root}")
+        return []
+
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    items = []
+    skipped_dirs = 0
+
+    for source_dir in sorted(root.iterdir()):
+        if not source_dir.is_dir():
+            continue
+
+        split_dirs = [d for d in [source_dir / "train", source_dir / "val"] if d.is_dir()]
+        if not split_dirs:
+            split_dirs = [source_dir]
+
+        for split_dir in split_dirs:
+            split_name = split_dir.name
+            for class_dir_name, label in [("nature", 0), ("ai", 1)]:
+                class_dir = split_dir / class_dir_name
+                if not class_dir.is_dir():
+                    skipped_dirs += 1
+                    continue
+
+                dataset_name = f"GEN_{source_dir.name}_{split_name}"
+                for path in sorted(class_dir.rglob("*")):
+                    if path.is_file() and path.suffix.lower() in image_exts:
+                        items.append({
+                            "path": str(path),
+                            "label": label,
+                            "dataset": dataset_name,
+                        })
+
+    if skipped_dirs:
+        print(f"  [GEN] skipped {skipped_dirs} missing nature/ai folders")
+    print_dataset_item_counts("GEN frames loaded", items)
+    return items
+
+
 def build_dataset_items(args):
     print("\nBuilding training dataset frame lists ...")
     dataset_items = {
-        "DVF": build_dvf_items(args.dvf_root),
+        "GEN": build_gen_items(args.gen_root),
     }
+
+    if args.include_dvf:
+        dataset_items["DVF"] = build_dvf_items(args.dvf_root)
 
     if args.include_base_datasets:
         dataset_items.update({
