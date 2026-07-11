@@ -20,6 +20,11 @@ import numpy as np
 import pandas as pd
 import timm
 import torch
+import transformers
+
+if not hasattr(transformers, "HybridCache"):
+    transformers.HybridCache = getattr(transformers, "DynamicCache", getattr(transformers, "Cache", object))
+
 from peft import LoraConfig, get_peft_model
 from sklearn.metrics import (
     accuracy_score,

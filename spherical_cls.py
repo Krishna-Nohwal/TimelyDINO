@@ -24,6 +24,11 @@ import pandas as pd
 import timm
 import torch
 import torch.optim as optim
+import transformers
+
+if not hasattr(transformers, "HybridCache"):
+    transformers.HybridCache = getattr(transformers, "DynamicCache", getattr(transformers, "Cache", object))
+
 from peft import LoraConfig, get_peft_model
 from pytorch_metric_learning.losses import SupConLoss
 from sklearn.metrics import (
