@@ -100,12 +100,20 @@ parser.add_argument("--wdf_fake_root",   default="/raid/krishna/wdf/test/fake", 
 parser.add_argument("--wdf_real_root",   default="/raid/krishna/wdf/test/real", type=str)
 parser.add_argument("--uadfv_fake_root", default="/raid/krishna/uadfv_faces/fake", type=str)
 parser.add_argument("--uadfv_real_root", default="/raid/krishna/uadfv_faces/real", type=str)
+parser.add_argument("--human_real_root",
+                    default="/media/tarun/B482367C823642E2/usr/real/Human Faces Dataset/Real Images",
+                    type=str)
+parser.add_argument("--video_frames_root",
+                    default="/home/tarun/Desktop/videos/videos/frames",
+                    type=str)
 parser.add_argument("--gen_root",       default="/media/tarun/B482367C823642E2/usr/gen", type=str)
+parser.add_argument("--include_gen",    action="store_true",
+                    help="Also train on GEN/ImageNet-style nature/ai frames from --gen_root.")
 parser.add_argument("--dvf_root",       default="", type=str)
 parser.add_argument("--include_dvf",    action="store_true",
                     help="Also train on DVF frames from --dvf_root.")
 parser.add_argument("--include_base_datasets", action="store_true",
-                    help="Also train on the older FFPP/CDF/DFD/DFDC/WDF/UADFV frame pools. Default is GEN only.")
+                    help="Also train on the older FFPP/CDF/DFD/DFDC/WDF/UADFV frame pools.")
 parser.add_argument("--no_compile",    action="store_true")
 args = parser.parse_args()
 
@@ -519,11 +527,59 @@ def build_gen_items(gen_root: str):
     return items
 
 
+def build_human_video_items(real_root: str, fake_frames_root: str):
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    items = []
+
+    if not real_root:
+        print("  [HumanVideo] WARNING: --human_real_root not provided.")
+    else:
+        root = Path(real_root)
+        if not root.is_dir():
+            print(f"  [HumanVideo] WARNING: missing real root {root}")
+        else:
+            for path in sorted(root.rglob("*")):
+                if path.is_file() and path.suffix.lower() in image_exts:
+                    items.append({
+                        "path": str(path),
+                        "label": 0,
+                        "dataset": "HumanVideo",
+                    })
+
+    if not fake_frames_root:
+        print("  [HumanVideo] WARNING: --video_frames_root not provided.")
+    else:
+        root = Path(fake_frames_root)
+        if not root.is_dir():
+            print(f"  [HumanVideo] WARNING: missing fake frames root {root}")
+        else:
+            skipped = 0
+            for video_dir in sorted(root.iterdir()):
+                if not video_dir.is_dir():
+                    skipped += 1
+                    continue
+                for path in sorted(video_dir.rglob("*")):
+                    if path.is_file() and path.suffix.lower() in image_exts:
+                        items.append({
+                            "path": str(path),
+                            "label": 1,
+                            "dataset": "HumanVideo",
+                        })
+            if skipped:
+                print(f"  [HumanVideo] skipped {skipped} non-directory entries under {root}")
+
+    print_dataset_item_counts("Human real / video-frame fake frames loaded", items)
+    return items
+
+
 def build_dataset_items(args):
     print("\nBuilding training dataset frame lists ...")
     dataset_items = {
-        "GEN": build_gen_items(args.gen_root),
+        "HumanVideo": build_human_video_items(args.human_real_root, args.video_frames_root),
     }
+
+    if args.include_gen:
+        dataset_items["GEN"] = build_gen_items(args.gen_root)
 
     if args.include_dvf:
         dataset_items["DVF"] = build_dvf_items(args.dvf_root)
